@@ -17,3 +17,7 @@ path = "examples/basic_parser.rs"
 [[example]]
 name = "heap_explorer"
 path = "examples/heap_explorer.rs"
+
+[[example]]
+name = "query_heap"
+path = "examples/query_heap.rs"

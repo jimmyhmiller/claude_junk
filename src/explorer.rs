@@ -218,6 +218,82 @@ impl<R: Read> HeapExplorer<R> {
             total_roots: self.roots.len(),
         }
     }
+
+    /// Extract a field value from an instance by field index
+    /// Returns the raw bytes of the field
+    pub fn get_field_bytes(&self, instance: &InstanceInfo, field_index: usize) -> Option<Vec<u8>> {
+        let class_info = self.get_class(instance.class_object_id)?;
+
+        if field_index >= class_info.instance_fields.len() {
+            return None;
+        }
+
+        let mut offset = 0;
+        for (i, field) in class_info.instance_fields.iter().enumerate() {
+            let size = field.field_type.size(self.parser.header().id_size);
+
+            if i == field_index {
+                if offset + size as usize <= instance.data.len() {
+                    return Some(instance.data[offset..offset + size as usize].to_vec());
+                } else {
+                    return None;
+                }
+            }
+
+            offset += size as usize;
+        }
+
+        None
+    }
+
+    /// Extract an object ID from a field (for reference fields)
+    pub fn get_field_object_id(&self, instance: &InstanceInfo, field_index: usize) -> Option<ObjectId> {
+        let bytes = self.get_field_bytes(instance, field_index)?;
+        let id_size = self.parser.header().id_size as usize;
+
+        if id_size == 4 && bytes.len() >= 4 {
+            Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64)
+        } else if id_size == 8 && bytes.len() >= 8 {
+            Some(u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]))
+        } else {
+            None
+        }
+    }
+
+    /// Extract a string value from an object reference field
+    /// This follows the object reference to get the string
+    pub fn get_field_string(&self, instance: &InstanceInfo, field_index: usize) -> Option<&str> {
+        let object_id = self.get_field_object_id(instance, field_index)?;
+        if object_id == 0 {
+            return None; // null reference
+        }
+        self.get_string(object_id)
+    }
+
+    /// Get field name by index for a given instance
+    pub fn get_field_name(&self, instance: &InstanceInfo, field_index: usize) -> Option<&str> {
+        let class_info = self.get_class(instance.class_object_id)?;
+        let field = class_info.instance_fields.get(field_index)?;
+        self.get_string(field.name_id)
+    }
+
+    /// List all field names for an instance
+    pub fn get_instance_fields(&self, instance: &InstanceInfo) -> Vec<(String, PrimitiveType)> {
+        let class_info = match self.get_class(instance.class_object_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        class_info.instance_fields.iter()
+            .map(|field| {
+                let name = self.get_string(field.name_id).unwrap_or("<unknown>").to_string();
+                (name, field.field_type)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
