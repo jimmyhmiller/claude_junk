@@ -31,4 +31,4 @@ pub use error::{HprofError, Result};
 pub use parser::HprofParser;
 pub use record::Record;
 pub use types::*;
-pub use explorer::HeapExplorer;
+pub use explorer::{HeapExplorer, ExplorerConfig};

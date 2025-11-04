@@ -153,13 +153,43 @@ Key concepts:
 
 ## Memory Usage
 
-The parser is designed for constant memory usage:
+The library supports three modes for handling different heap dump sizes:
 
-- Records are processed one at a time
-- Large data (instance data, arrays) are read directly without buffering
-- The `HeapExplorer` builds indices but can be used with `process_n()` for limited indexing
+### 1. Normal Mode (Default)
+- Stores all instances in memory for fast queries
+- Good for dumps < 1GB
+- Full instance inspection capabilities
 
-For multi-GB heap dumps, use the low-level `HprofParser` API for true constant memory.
+```rust
+let explorer = HeapExplorer::new(file)?;
+```
+
+### 2. Low-Memory Mode
+- **Perfect for multi-GB dumps**
+- Doesn't store instance data, only counts
+- Constant memory usage regardless of dump size
+- Can still query class counts and statistics
+
+```rust
+let config = ExplorerConfig::low_memory();
+let explorer = HeapExplorer::with_config(file, config)?;
+
+// Still works! Counts tracked during streaming
+let top = explorer.top_classes_by_count(10);
+```
+
+### 3. Selective Indexing
+- Only stores instances of specific classes
+- Good for focused analysis on large dumps
+- Configurable per-class instance limits
+
+```rust
+// Only store Person instances, max 100 per class
+let config = ExplorerConfig::selective("Person", Some(100));
+let explorer = HeapExplorer::with_config(file, config)?;
+```
+
+**Example:** Run `cargo run --release --example multi_gb_support` to see all three modes in action.
 
 ## Testing
 
