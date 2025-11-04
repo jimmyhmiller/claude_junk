@@ -25,3 +25,7 @@ path = "examples/query_heap.rs"
 [[example]]
 name = "llm_transcript"
 path = "examples/llm_transcript.rs"
+
+[[example]]
+name = "stateful_queries"
+path = "examples/stateful_queries.rs"
