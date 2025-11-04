@@ -29,7 +29,3 @@ path = "examples/llm_transcript.rs"
 [[example]]
 name = "stateful_queries"
 path = "examples/stateful_queries.rs"
-
-[[example]]
-name = "multi_gb_support"
-path = "examples/multi_gb_support.rs"

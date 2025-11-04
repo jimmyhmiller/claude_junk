@@ -151,45 +151,46 @@ Key concepts:
 - **Heap Dump Sub-records**: GC roots, class dumps, instance dumps, array dumps
 - **Streaming**: Records can be processed one at a time without loading the entire file
 
-## Memory Usage
+## Memory Usage - Smart by Default
 
-The library supports three modes for handling different heap dump sizes:
+The `HeapExplorer` automatically handles heap dumps of any size:
 
-### 1. Normal Mode (Default)
-- Stores all instances in memory for fast queries
-- Good for dumps < 1GB
-- Full instance inspection capabilities
+**Smart Defaults:**
+- Stores first **1000 instances per class**
+- Tracks **total counts** for all instances
+- Memory usage is **bounded** regardless of dump size
+- Works for both small (MB) and huge (multi-GB) dumps
 
 ```rust
 let explorer = HeapExplorer::new(file)?;
+explorer.process_all()?;
+
+// Get total counts (works even if not all instances stored)
+let top = explorer.top_classes_by_count(10);  // Uses actual counts
+let total = explorer.get_instance_count(class_id);  // Total from dump
+
+// Inspect stored instances (up to 1000 per class)
+let instances = explorer.get_instances_of_class(class_id);
+let stored = instances.len();  // May be less than total
+
+// Check how many were stored
+let stored_count = explorer.get_stored_instance_count(class_id);
 ```
 
-### 2. Low-Memory Mode
-- **Perfect for multi-GB dumps**
-- Doesn't store instance data, only counts
-- Constant memory usage regardless of dump size
-- Can still query class counts and statistics
+**Why 1000?**
+- Large enough for meaningful analysis
+- Small enough to bound memory (1000 instances × ~2000 classes = ~2M instances max)
+- For a class with 1 million instances, storing 1000 samples is plenty for inspection
 
+**For unlimited storage** (use with caution on large dumps):
 ```rust
-let config = ExplorerConfig::low_memory();
-let explorer = HeapExplorer::with_config(file, config)?;
-
-// Still works! Counts tracked during streaming
-let top = explorer.top_classes_by_count(10);
+let explorer = HeapExplorer::with_max_instances_per_class(file, usize::MAX)?;
 ```
 
-### 3. Selective Indexing
-- Only stores instances of specific classes
-- Good for focused analysis on large dumps
-- Configurable per-class instance limits
-
-```rust
-// Only store Person instances, max 100 per class
-let config = ExplorerConfig::selective("Person", Some(100));
-let explorer = HeapExplorer::with_config(file, config)?;
-```
-
-**Example:** Run `cargo run --release --example multi_gb_support` to see all three modes in action.
+This design means the LLM can always ask:
+- ✅ "What are the top classes by count?" (uses real totals)
+- ✅ "Show me instance #5 of Person" (if within first 1000)
+- ✅ "How many String objects?" (accurate total count)
 
 ## Testing
 

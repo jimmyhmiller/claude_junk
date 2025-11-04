@@ -5,73 +5,27 @@ use crate::types::*;
 use std::collections::HashMap;
 use std::io::Read;
 
-/// Configuration for HeapExplorer to control memory usage
-#[derive(Debug, Clone)]
-pub struct ExplorerConfig {
-    /// Store all instance data in memory (default: true)
-    /// For large dumps, set to false to only track counts
-    pub store_instances: bool,
-
-    /// Maximum number of instances to store per class
-    /// None = unlimited, Some(n) = limit to n instances per class
-    pub max_instances_per_class: Option<usize>,
-
-    /// Only store instances of classes matching this pattern
-    /// None = store all, Some(pattern) = only matching classes
-    pub instance_filter: Option<String>,
-
-    /// Store string table in memory (default: true)
-    /// Strings are typically small, so this is usually safe
-    pub store_strings: bool,
-}
-
-impl Default for ExplorerConfig {
-    fn default() -> Self {
-        Self {
-            store_instances: true,
-            max_instances_per_class: None,
-            instance_filter: None,
-            store_strings: true,
-        }
-    }
-}
-
-impl ExplorerConfig {
-    /// Create a config optimized for multi-GB heap dumps
-    /// - Doesn't store instance data
-    /// - Only tracks counts and metadata
-    pub fn low_memory() -> Self {
-        Self {
-            store_instances: false,
-            max_instances_per_class: None,
-            instance_filter: None,
-            store_strings: true,
-        }
-    }
-
-    /// Create a config for selective indexing
-    /// Only stores instances of classes matching the pattern
-    pub fn selective(pattern: &str, max_per_class: Option<usize>) -> Self {
-        Self {
-            store_instances: true,
-            max_instances_per_class: max_per_class,
-            instance_filter: Some(pattern.to_string()),
-            store_strings: true,
-        }
-    }
-}
+/// Default maximum instances to store per class
+/// This keeps memory bounded while allowing instance inspection
+const DEFAULT_MAX_INSTANCES_PER_CLASS: usize = 1000;
 
 /// High-level API for exploring heap dumps
 /// Designed to be LLM-friendly with simple queries
+///
+/// Smart memory management:
+/// - Stores first 1000 instances per class (configurable)
+/// - Tracks total counts for all instances
+/// - This bounds memory usage while keeping full functionality
+/// - Works automatically for both small and multi-GB dumps
 pub struct HeapExplorer<R: Read> {
     parser: HprofParser<R>,
-    config: ExplorerConfig,
+    max_instances_per_class: usize,
     strings: HashMap<ObjectId, String>,
     classes: HashMap<ObjectId, ClassInfo>,
     class_names: HashMap<ObjectId, ObjectId>, // class_id -> name_id
     instances: HashMap<ObjectId, InstanceInfo>,
-    instance_counts: HashMap<ObjectId, usize>, // class_id -> count (for low-memory mode)
-    instances_per_class: HashMap<ObjectId, usize>, // track how many we've stored per class
+    instance_counts: HashMap<ObjectId, usize>, // total count for each class
+    instances_per_class: HashMap<ObjectId, usize>, // how many stored per class
     roots: Vec<RootType>,
     loaded_classes: HashMap<u32, LoadedClassInfo>,
 }
@@ -91,17 +45,19 @@ pub struct InstanceInfo {
 }
 
 impl<R: Read> HeapExplorer<R> {
-    /// Create a new heap explorer with default configuration
+    /// Create a new heap explorer
+    /// Automatically stores up to 1000 instances per class
     pub fn new(reader: R) -> Result<Self> {
-        Self::with_config(reader, ExplorerConfig::default())
+        Self::with_max_instances_per_class(reader, DEFAULT_MAX_INSTANCES_PER_CLASS)
     }
 
-    /// Create a new heap explorer with custom configuration
-    pub fn with_config(reader: R, config: ExplorerConfig) -> Result<Self> {
+    /// Create a new heap explorer with custom per-class instance limit
+    /// Set to usize::MAX for unlimited storage (use with caution on large dumps)
+    pub fn with_max_instances_per_class(reader: R, max: usize) -> Result<Self> {
         let parser = HprofParser::new(reader)?;
         Ok(Self {
             parser,
-            config,
+            max_instances_per_class: max,
             strings: HashMap::new(),
             classes: HashMap::new(),
             class_names: HashMap::new(),
@@ -113,9 +69,9 @@ impl<R: Read> HeapExplorer<R> {
         })
     }
 
-    /// Get the current configuration
-    pub fn config(&self) -> &ExplorerConfig {
-        &self.config
+    /// Get the max instances per class limit
+    pub fn max_instances_per_class(&self) -> usize {
+        self.max_instances_per_class
     }
 
     /// Get the header information
@@ -157,9 +113,7 @@ impl<R: Read> HeapExplorer<R> {
     fn index_record(&mut self, record: Record) {
         match record {
             Record::String { id, text } => {
-                if self.config.store_strings {
-                    self.strings.insert(id, text);
-                }
+                self.strings.insert(id, text);
             }
             Record::LoadClass {
                 class_serial,
@@ -186,33 +140,12 @@ impl<R: Read> HeapExplorer<R> {
                 data,
                 ..
             } => {
-                // Always track counts
+                // Always track total counts
                 *self.instance_counts.entry(class_object_id).or_insert(0) += 1;
 
-                // Check if we should store this instance
-                let should_store = if !self.config.store_instances {
-                    false
-                } else if let Some(ref pattern) = self.config.instance_filter {
-                    // Check if class name matches pattern
-                    if let Some(class_name) = self.get_class_name(class_object_id) {
-                        class_name.to_lowercase().contains(&pattern.to_lowercase())
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                };
-
-                if should_store {
-                    // Check per-class instance limit
-                    if let Some(max) = self.config.max_instances_per_class {
-                        let count = self.instances_per_class.entry(class_object_id).or_insert(0);
-                        if *count >= max {
-                            return; // Skip this instance
-                        }
-                        *count += 1;
-                    }
-
+                // Store up to max_instances_per_class per class
+                let count = self.instances_per_class.entry(class_object_id).or_insert(0);
+                if *count < self.max_instances_per_class {
                     self.instances.insert(
                         object_id,
                         InstanceInfo {
@@ -221,6 +154,7 @@ impl<R: Read> HeapExplorer<R> {
                             data,
                         },
                     );
+                    *count += 1;
                 }
             }
             Record::Root(root) => {
@@ -279,26 +213,20 @@ impl<R: Read> HeapExplorer<R> {
     }
 
     /// Count instances by class
-    /// In low-memory mode, returns actual counts from streaming
-    /// In normal mode, returns counts from stored instances
+    /// Returns the total count from the heap dump (not just stored instances)
     pub fn count_instances_by_class(&self) -> HashMap<ObjectId, usize> {
-        if self.config.store_instances && self.config.instance_filter.is_none() {
-            // Normal mode: count from stored instances
-            let mut counts = HashMap::new();
-            for instance in self.instances.values() {
-                *counts.entry(instance.class_object_id).or_insert(0) += 1;
-            }
-            counts
-        } else {
-            // Low-memory or filtered mode: use tracked counts
-            self.instance_counts.clone()
-        }
+        self.instance_counts.clone()
     }
 
-    /// Get the actual instance count for a class (including unstored instances)
-    /// This is the true count from the heap dump
+    /// Get the total instance count for a class from the heap dump
     pub fn get_instance_count(&self, class_id: ObjectId) -> usize {
         self.instance_counts.get(&class_id).copied().unwrap_or(0)
+    }
+
+    /// Get the number of stored instances for a class
+    /// May be less than total count if limit was reached
+    pub fn get_stored_instance_count(&self, class_id: ObjectId) -> usize {
+        self.instances_per_class.get(&class_id).copied().unwrap_or(0)
     }
 
     /// Get top N classes by instance count
