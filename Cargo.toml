@@ -29,3 +29,11 @@ path = "examples/llm_transcript.rs"
 [[example]]
 name = "stateful_queries"
 path = "examples/stateful_queries.rs"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
+
+[[example]]
+name = "simple_bench"
+path = "examples/simple_bench.rs"
