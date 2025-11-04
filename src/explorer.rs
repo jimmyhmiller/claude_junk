@@ -3,29 +3,24 @@ use crate::parser::HprofParser;
 use crate::record::Record;
 use crate::types::*;
 use std::collections::HashMap;
-use std::io::Read;
-
-/// Default maximum instances to store per class
-/// This keeps memory bounded while allowing instance inspection
-const DEFAULT_MAX_INSTANCES_PER_CLASS: usize = 1000;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 /// High-level API for exploring heap dumps
 /// Designed to be LLM-friendly with simple queries
 ///
-/// Smart memory management:
-/// - Stores first 1000 instances per class (configurable)
-/// - Tracks total counts for all instances
-/// - This bounds memory usage while keeping full functionality
-/// - Works automatically for both small and multi-GB dumps
-pub struct HeapExplorer<R: Read> {
-    parser: HprofParser<R>,
-    max_instances_per_class: usize,
+/// Architecture:
+/// - Stores metadata only (classes, strings, counts)
+/// - Does NOT store instance data in memory
+/// - Each query scans through the file linearly
+/// - Simple, works for any dump size
+pub struct HeapExplorer {
+    file_path: PathBuf,
+    header: HprofHeader,
     strings: HashMap<ObjectId, String>,
     classes: HashMap<ObjectId, ClassInfo>,
-    class_names: HashMap<ObjectId, ObjectId>, // class_id -> name_id
-    instances: HashMap<ObjectId, InstanceInfo>,
-    instance_counts: HashMap<ObjectId, usize>, // total count for each class
-    instances_per_class: HashMap<ObjectId, usize>, // how many stored per class
+    class_names: HashMap<ObjectId, ObjectId>,
+    instance_counts: HashMap<ObjectId, usize>,
     roots: Vec<RootType>,
     loaded_classes: HashMap<u32, LoadedClassInfo>,
 }
@@ -44,73 +39,44 @@ pub struct InstanceInfo {
     pub data: Vec<u8>,
 }
 
-impl<R: Read> HeapExplorer<R> {
-    /// Create a new heap explorer
-    /// Automatically stores up to 1000 instances per class
-    pub fn new(reader: R) -> Result<Self> {
-        Self::with_max_instances_per_class(reader, DEFAULT_MAX_INSTANCES_PER_CLASS)
-    }
+impl HeapExplorer {
+    /// Create a new heap explorer from a file path
+    /// Does an initial scan to build metadata (classes, strings, counts)
+    /// Instance data is NOT stored - queries scan the file on-demand
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file_path = path.as_ref().to_path_buf();
 
-    /// Create a new heap explorer with custom per-class instance limit
-    /// Set to usize::MAX for unlimited storage (use with caution on large dumps)
-    pub fn with_max_instances_per_class(reader: R, max: usize) -> Result<Self> {
-        let parser = HprofParser::new(reader)?;
-        Ok(Self {
-            parser,
-            max_instances_per_class: max,
+        // First pass: build metadata
+        let file = File::open(&file_path)?;
+        let mut parser = HprofParser::new(file)?;
+        let header = parser.header().clone();
+
+        let mut explorer = Self {
+            file_path,
+            header,
             strings: HashMap::new(),
             classes: HashMap::new(),
             class_names: HashMap::new(),
-            instances: HashMap::new(),
             instance_counts: HashMap::new(),
-            instances_per_class: HashMap::new(),
             roots: Vec::new(),
             loaded_classes: HashMap::new(),
-        })
-    }
+        };
 
-    /// Get the max instances per class limit
-    pub fn max_instances_per_class(&self) -> usize {
-        self.max_instances_per_class
+        // Scan to build metadata
+        while let Some(record) = parser.next_record()? {
+            explorer.index_metadata(record);
+        }
+
+        Ok(explorer)
     }
 
     /// Get the header information
     pub fn header(&self) -> &HprofHeader {
-        self.parser.header()
+        &self.header
     }
 
-    /// Process the next record in the stream
-    /// Returns false when EOF is reached
-    pub fn process_next(&mut self) -> Result<bool> {
-        match self.parser.next_record()? {
-            Some(record) => {
-                self.index_record(record);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    /// Process all remaining records
-    pub fn process_all(&mut self) -> Result<()> {
-        while self.process_next()? {}
-        Ok(())
-    }
-
-    /// Process a limited number of records
-    pub fn process_n(&mut self, n: usize) -> Result<usize> {
-        let mut count = 0;
-        for _ in 0..n {
-            if !self.process_next()? {
-                break;
-            }
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Index a record for quick lookup
-    fn index_record(&mut self, record: Record) {
+    /// Index metadata from a record (does NOT store instance data)
+    fn index_metadata(&mut self, record: Record) {
         match record {
             Record::String { id, text } => {
                 self.strings.insert(id, text);
@@ -135,27 +101,10 @@ impl<R: Read> HeapExplorer<R> {
                 self.classes.insert(class_info.object_id, class_info);
             }
             Record::InstanceDump {
-                object_id,
-                class_object_id,
-                data,
-                ..
+                class_object_id, ..
             } => {
-                // Always track total counts
+                // Only track counts, don't store data
                 *self.instance_counts.entry(class_object_id).or_insert(0) += 1;
-
-                // Store up to max_instances_per_class per class
-                let count = self.instances_per_class.entry(class_object_id).or_insert(0);
-                if *count < self.max_instances_per_class {
-                    self.instances.insert(
-                        object_id,
-                        InstanceInfo {
-                            object_id,
-                            class_object_id,
-                            data,
-                        },
-                    );
-                    *count += 1;
-                }
             }
             Record::Root(root) => {
                 self.roots.push(root);
@@ -179,11 +128,6 @@ impl<R: Read> HeapExplorer<R> {
         self.class_names
             .get(&class_id)
             .and_then(|name_id| self.get_string(*name_id))
-    }
-
-    /// Get an instance by object ID
-    pub fn get_instance(&self, id: ObjectId) -> Option<&InstanceInfo> {
-        self.instances.get(&id)
     }
 
     /// Get all GC roots
@@ -223,12 +167,6 @@ impl<R: Read> HeapExplorer<R> {
         self.instance_counts.get(&class_id).copied().unwrap_or(0)
     }
 
-    /// Get the number of stored instances for a class
-    /// May be less than total count if limit was reached
-    pub fn get_stored_instance_count(&self, class_id: ObjectId) -> usize {
-        self.instances_per_class.get(&class_id).copied().unwrap_or(0)
-    }
-
     /// Get top N classes by instance count
     pub fn top_classes_by_count(&self, n: usize) -> Vec<(String, usize)> {
         let counts = self.count_instances_by_class();
@@ -245,20 +183,69 @@ impl<R: Read> HeapExplorer<R> {
         class_counts
     }
 
-    /// Get instances of a specific class
-    pub fn get_instances_of_class(&self, class_id: ObjectId) -> Vec<&InstanceInfo> {
-        self.instances
-            .values()
-            .filter(|inst| inst.class_object_id == class_id)
-            .collect()
+    /// Get instances of a specific class by scanning the file
+    /// Each call re-scans the file linearly
+    pub fn get_instances_of_class(&self, class_id: ObjectId) -> Result<Vec<InstanceInfo>> {
+        let mut instances = Vec::new();
+
+        let file = File::open(&self.file_path)?;
+        let mut parser = HprofParser::new(file)?;
+
+        while let Some(record) = parser.next_record()? {
+            if let Record::InstanceDump {
+                object_id,
+                class_object_id,
+                data,
+                ..
+            } = record
+            {
+                if class_object_id == class_id {
+                    instances.push(InstanceInfo {
+                        object_id,
+                        class_object_id,
+                        data,
+                    });
+                }
+            }
+        }
+
+        Ok(instances)
+    }
+
+    /// Get a specific instance by object ID
+    /// Scans the file until the instance is found
+    pub fn get_instance(&self, target_id: ObjectId) -> Result<Option<InstanceInfo>> {
+        let file = File::open(&self.file_path)?;
+        let mut parser = HprofParser::new(file)?;
+
+        while let Some(record) = parser.next_record()? {
+            if let Record::InstanceDump {
+                object_id,
+                class_object_id,
+                data,
+                ..
+            } = record
+            {
+                if object_id == target_id {
+                    return Ok(Some(InstanceInfo {
+                        object_id,
+                        class_object_id,
+                        data,
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Get statistics about the heap
     pub fn get_statistics(&self) -> HeapStatistics {
+        let total_instances: usize = self.instance_counts.values().sum();
         HeapStatistics {
             total_strings: self.strings.len(),
             total_classes: self.classes.len(),
-            total_instances: self.instances.len(),
+            total_instances,
             total_roots: self.roots.len(),
         }
     }
@@ -274,7 +261,7 @@ impl<R: Read> HeapExplorer<R> {
 
         let mut offset = 0;
         for (i, field) in class_info.instance_fields.iter().enumerate() {
-            let size = field.field_type.size(self.parser.header().id_size);
+            let size = field.field_type.size(self.header.id_size);
 
             if i == field_index {
                 if offset + size as usize <= instance.data.len() {
@@ -293,7 +280,7 @@ impl<R: Read> HeapExplorer<R> {
     /// Extract an object ID from a field (for reference fields)
     pub fn get_field_object_id(&self, instance: &InstanceInfo, field_index: usize) -> Option<ObjectId> {
         let bytes = self.get_field_bytes(instance, field_index)?;
-        let id_size = self.parser.header().id_size as usize;
+        let id_size = self.header.id_size as usize;
 
         if id_size == 4 && bytes.len() >= 4 {
             Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64)

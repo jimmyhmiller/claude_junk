@@ -9,7 +9,6 @@
 /// follow-up questions without reloading the entire heap.
 
 use hprof_parser::HeapExplorer;
-use std::fs::File;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,9 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading and processing heap dump...");
     let start = Instant::now();
 
-    let file = File::open("java-test/heap-dump.hprof")?;
-    let mut explorer = HeapExplorer::new(file)?;
-    explorer.process_all()?;
+    let explorer = HeapExplorer::new("java-test/heap-dump.hprof")?;
 
     let load_time = start.elapsed();
     println!("✓ Loaded in {:.2}s\n", load_time.as_secs_f64());
@@ -61,8 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Query 4: How many Person instances are there?");
     let start = Instant::now();
     if let Some((class_id, class_name)) = person_classes.first() {
-        let instances = explorer.get_instances_of_class(*class_id);
-        println!("  {} has {} instances", class_name, instances.len());
+        let count = explorer.get_instance_count(*class_id);
+        println!("  {} has {} instances", class_name, count);
     }
     println!("⚡ Query time: {:.4}s\n", start.elapsed().as_secs_f64());
 
@@ -70,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Query 5: What fields does Person have?");
     let start = Instant::now();
     if let Some((class_id, _)) = person_classes.first() {
-        let instances = explorer.get_instances_of_class(*class_id);
+        let instances = explorer.get_instances_of_class(*class_id)?;
         if let Some(first) = instances.first() {
             let fields = explorer.get_instance_fields(first);
             for (i, (name, ftype)) in fields.iter().enumerate() {
@@ -96,10 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hashmap_classes = explorer.find_classes("HashMap");
     let mut total = 0;
     for (class_id, class_name) in &hashmap_classes {
-        let instances = explorer.get_instances_of_class(*class_id);
-        if instances.len() > 0 {
-            println!("  {} - {} instances", class_name, instances.len());
-            total += instances.len();
+        let count = explorer.get_instance_count(*class_id);
+        if count > 0 {
+            println!("  {} - {} instances", class_name, count);
+            total += count;
         }
     }
     println!("  Total: {} HashMap-related instances", total);
