@@ -21,3 +21,7 @@ path = "examples/heap_explorer.rs"
 [[example]]
 name = "query_heap"
 path = "examples/query_heap.rs"
+
+[[example]]
+name = "llm_transcript"
+path = "examples/llm_transcript.rs"
