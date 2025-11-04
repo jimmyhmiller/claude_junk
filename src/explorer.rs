@@ -1,0 +1,243 @@
+use crate::error::Result;
+use crate::parser::HprofParser;
+use crate::record::Record;
+use crate::types::*;
+use std::collections::HashMap;
+use std::io::Read;
+
+/// High-level API for exploring heap dumps
+/// Designed to be LLM-friendly with simple queries
+pub struct HeapExplorer<R: Read> {
+    parser: HprofParser<R>,
+    strings: HashMap<ObjectId, String>,
+    classes: HashMap<ObjectId, ClassInfo>,
+    class_names: HashMap<ObjectId, ObjectId>, // class_id -> name_id
+    instances: HashMap<ObjectId, InstanceInfo>,
+    roots: Vec<RootType>,
+    loaded_classes: HashMap<u32, LoadedClassInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedClassInfo {
+    pub class_serial: u32,
+    pub object_id: ObjectId,
+    pub class_name_id: ObjectId,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstanceInfo {
+    pub object_id: ObjectId,
+    pub class_object_id: ObjectId,
+    pub data: Vec<u8>,
+}
+
+impl<R: Read> HeapExplorer<R> {
+    /// Create a new heap explorer
+    pub fn new(reader: R) -> Result<Self> {
+        let parser = HprofParser::new(reader)?;
+        Ok(Self {
+            parser,
+            strings: HashMap::new(),
+            classes: HashMap::new(),
+            class_names: HashMap::new(),
+            instances: HashMap::new(),
+            roots: Vec::new(),
+            loaded_classes: HashMap::new(),
+        })
+    }
+
+    /// Get the header information
+    pub fn header(&self) -> &HprofHeader {
+        self.parser.header()
+    }
+
+    /// Process the next record in the stream
+    /// Returns false when EOF is reached
+    pub fn process_next(&mut self) -> Result<bool> {
+        match self.parser.next_record()? {
+            Some(record) => {
+                self.index_record(record);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Process all remaining records
+    pub fn process_all(&mut self) -> Result<()> {
+        while self.process_next()? {}
+        Ok(())
+    }
+
+    /// Process a limited number of records
+    pub fn process_n(&mut self, n: usize) -> Result<usize> {
+        let mut count = 0;
+        for _ in 0..n {
+            if !self.process_next()? {
+                break;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Index a record for quick lookup
+    fn index_record(&mut self, record: Record) {
+        match record {
+            Record::String { id, text } => {
+                self.strings.insert(id, text);
+            }
+            Record::LoadClass {
+                class_serial,
+                object_id,
+                class_name_id,
+                ..
+            } => {
+                self.class_names.insert(object_id, class_name_id);
+                self.loaded_classes.insert(
+                    class_serial,
+                    LoadedClassInfo {
+                        class_serial,
+                        object_id,
+                        class_name_id,
+                    },
+                );
+            }
+            Record::ClassDump(class_info) => {
+                self.classes.insert(class_info.object_id, class_info);
+            }
+            Record::InstanceDump {
+                object_id,
+                class_object_id,
+                data,
+                ..
+            } => {
+                self.instances.insert(
+                    object_id,
+                    InstanceInfo {
+                        object_id,
+                        class_object_id,
+                        data,
+                    },
+                );
+            }
+            Record::Root(root) => {
+                self.roots.push(root);
+            }
+            _ => {}
+        }
+    }
+
+    /// Get a string by ID
+    pub fn get_string(&self, id: ObjectId) -> Option<&str> {
+        self.strings.get(&id).map(|s| s.as_str())
+    }
+
+    /// Get a class by object ID
+    pub fn get_class(&self, id: ObjectId) -> Option<&ClassInfo> {
+        self.classes.get(&id)
+    }
+
+    /// Get class name for a class object ID
+    pub fn get_class_name(&self, class_id: ObjectId) -> Option<&str> {
+        self.class_names
+            .get(&class_id)
+            .and_then(|name_id| self.get_string(*name_id))
+    }
+
+    /// Get an instance by object ID
+    pub fn get_instance(&self, id: ObjectId) -> Option<&InstanceInfo> {
+        self.instances.get(&id)
+    }
+
+    /// Get all GC roots
+    pub fn get_roots(&self) -> &[RootType] {
+        &self.roots
+    }
+
+    /// List all loaded classes with their names
+    pub fn list_classes(&self) -> Vec<(ObjectId, String)> {
+        let mut result = Vec::new();
+        for (class_id, name_id) in &self.class_names {
+            if let Some(name) = self.get_string(*name_id) {
+                result.push((*class_id, name.to_string()));
+            }
+        }
+        result.sort_by(|a, b| a.1.cmp(&b.1));
+        result
+    }
+
+    /// Find classes by name pattern (case-insensitive substring match)
+    pub fn find_classes(&self, pattern: &str) -> Vec<(ObjectId, String)> {
+        let pattern_lower = pattern.to_lowercase();
+        self.list_classes()
+            .into_iter()
+            .filter(|(_, name)| name.to_lowercase().contains(&pattern_lower))
+            .collect()
+    }
+
+    /// Count instances by class
+    pub fn count_instances_by_class(&self) -> HashMap<ObjectId, usize> {
+        let mut counts = HashMap::new();
+        for instance in self.instances.values() {
+            *counts.entry(instance.class_object_id).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Get top N classes by instance count
+    pub fn top_classes_by_count(&self, n: usize) -> Vec<(String, usize)> {
+        let counts = self.count_instances_by_class();
+        let mut class_counts: Vec<_> = counts
+            .into_iter()
+            .filter_map(|(class_id, count)| {
+                self.get_class_name(class_id)
+                    .map(|name| (name.to_string(), count))
+            })
+            .collect();
+
+        class_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        class_counts.truncate(n);
+        class_counts
+    }
+
+    /// Get instances of a specific class
+    pub fn get_instances_of_class(&self, class_id: ObjectId) -> Vec<&InstanceInfo> {
+        self.instances
+            .values()
+            .filter(|inst| inst.class_object_id == class_id)
+            .collect()
+    }
+
+    /// Get statistics about the heap
+    pub fn get_statistics(&self) -> HeapStatistics {
+        HeapStatistics {
+            total_strings: self.strings.len(),
+            total_classes: self.classes.len(),
+            total_instances: self.instances.len(),
+            total_roots: self.roots.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeapStatistics {
+    pub total_strings: usize,
+    pub total_classes: usize,
+    pub total_instances: usize,
+    pub total_roots: usize,
+}
+
+impl std::fmt::Display for HeapStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Heap Statistics:\n\
+             - Strings: {}\n\
+             - Classes: {}\n\
+             - Instances: {}\n\
+             - GC Roots: {}",
+            self.total_strings, self.total_classes, self.total_instances, self.total_roots
+        )
+    }
+}

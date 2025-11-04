@@ -1,0 +1,19 @@
+[package]
+name = "hprof-parser"
+version = "0.1.0"
+edition = "2021"
+authors = ["Claude"]
+description = "A streaming parser for Java HPROF heap dumps"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]
+
+[[example]]
+name = "basic_parser"
+path = "examples/basic_parser.rs"
+
+[[example]]
+name = "heap_explorer"
+path = "examples/heap_explorer.rs"
