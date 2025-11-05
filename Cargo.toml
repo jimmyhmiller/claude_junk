@@ -37,3 +37,11 @@ path = "examples/benchmark.rs"
 [[example]]
 name = "simple_bench"
 path = "examples/simple_bench.rs"
+
+[[example]]
+name = "debug_strings"
+path = "examples/debug_strings.rs"
+
+[[example]]
+name = "scan_records"
+path = "examples/scan_records.rs"

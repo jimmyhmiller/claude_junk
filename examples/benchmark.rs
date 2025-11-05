@@ -22,13 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 2: Get all instances of most common class (String)
     println!("Test 2: Get ALL String instances (13,507 instances)");
-    let string_classes = explorer.find_classes("java/lang/String");
-    if let Some((class_id, _)) = string_classes.first() {
-        let count = explorer.get_instance_count(*class_id);
+    if let Some((class_id, _)) = explorer.find_class_exact("java/lang/String") {
+        let count = explorer.get_instance_count(class_id);
         println!("  Expected: {} instances", count);
 
         let start = Instant::now();
-        let instances = explorer.get_instances_of_class(*class_id)?;
+        let instances = explorer.get_instances_of_class(class_id)?;
         let query_time = start.elapsed();
 
         println!("  Returned: {} instances", instances.len());
@@ -38,13 +37,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 3: Get all instances of rare class (Person)
     println!("Test 3: Get ALL Person instances (250 instances)");
-    let person_classes = explorer.find_classes("Person");
-    if let Some((class_id, _)) = person_classes.first() {
-        let count = explorer.get_instance_count(*class_id);
+    if let Some((class_id, _)) = explorer.find_class_exact("com/example/HeapDumpGenerator$Person") {
+        let count = explorer.get_instance_count(class_id);
         println!("  Expected: {} instances", count);
 
         let start = Instant::now();
-        let instances = explorer.get_instances_of_class(*class_id)?;
+        let instances = explorer.get_instances_of_class(class_id)?;
         let query_time = start.elapsed();
 
         println!("  Returned: {} instances", instances.len());
@@ -53,13 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 4: Get all HashMap$Node instances (2,591 instances)
     println!("Test 4: Get ALL HashMap$Node instances (2,591 instances)");
-    let hashmap_classes = explorer.find_classes("java/util/HashMap$Node");
-    if let Some((class_id, _)) = hashmap_classes.first() {
-        let count = explorer.get_instance_count(*class_id);
+    if let Some((class_id, _)) = explorer.find_class_exact("java/util/HashMap$Node") {
+        let count = explorer.get_instance_count(class_id);
         println!("  Expected: {} instances", count);
 
         let start = Instant::now();
-        let instances = explorer.get_instances_of_class(*class_id)?;
+        let instances = explorer.get_instances_of_class(class_id)?;
         let query_time = start.elapsed();
 
         println!("  Returned: {} instances", instances.len());
@@ -79,9 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut total_instances = 0;
     for class_name in &classes_to_query {
-        let matches = explorer.find_classes(class_name);
-        if let Some((class_id, _)) = matches.first() {
-            let instances = explorer.get_instances_of_class(*class_id)?;
+        if let Some((class_id, _)) = explorer.find_class_exact(class_name) {
+            let instances = explorer.get_instances_of_class(class_id)?;
             total_instances += instances.len();
         }
     }
@@ -94,8 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 6: Find specific instance by ID
     println!("Test 6: Find specific instance by object ID");
-    if let Some((person_class_id, _)) = person_classes.first() {
-        let instances = explorer.get_instances_of_class(*person_class_id)?;
+    if let Some((person_class_id, _)) = explorer.find_class_exact("com/example/HeapDumpGenerator$Person") {
+        let instances = explorer.get_instances_of_class(person_class_id)?;
         if let Some(first) = instances.first() {
             let target_id = first.object_id;
 

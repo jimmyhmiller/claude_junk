@@ -156,6 +156,13 @@ impl HeapExplorer {
             .collect()
     }
 
+    /// Find a class by exact name match
+    pub fn find_class_exact(&self, name: &str) -> Option<(ObjectId, String)> {
+        self.list_classes()
+            .into_iter()
+            .find(|(_, class_name)| class_name == name)
+    }
+
     /// Count instances by class
     /// Returns the total count from the heap dump (not just stored instances)
     pub fn count_instances_by_class(&self) -> HashMap<ObjectId, usize> {
