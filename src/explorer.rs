@@ -193,7 +193,9 @@ impl HeapExplorer {
     /// Get instances of a specific class by scanning the file
     /// Each call re-scans the file linearly
     pub fn get_instances_of_class(&self, class_id: ObjectId) -> Result<Vec<InstanceInfo>> {
-        let mut instances = Vec::new();
+        // Pre-allocate with exact capacity to avoid reallocations during push
+        let count = self.get_instance_count(class_id);
+        let mut instances = Vec::with_capacity(count);
 
         let file = File::open(&self.file_path)?;
         let mut parser = HprofParser::new(file)?;

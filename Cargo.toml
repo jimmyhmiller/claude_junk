@@ -45,3 +45,7 @@ path = "examples/debug_strings.rs"
 [[example]]
 name = "scan_records"
 path = "examples/scan_records.rs"
+
+[[example]]
+name = "profile_scan"
+path = "examples/profile_scan.rs"

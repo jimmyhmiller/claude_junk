@@ -14,7 +14,8 @@ pub struct HprofParser<R: Read> {
 impl<R: Read> HprofParser<R> {
     /// Create a new parser from a reader
     pub fn new(reader: R) -> Result<Self> {
-        let mut reader = BufReader::new(reader);
+        // Use 8MB buffer for maximum throughput (default is only 8KB)
+        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
         let header = Self::parse_header(&mut reader)?;
 
         Ok(Self {
