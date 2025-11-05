@@ -1,14 +1,34 @@
 # HPROF Parser
 
-A streaming Rust library for parsing Java HPROF heap dumps with constant memory usage. Designed to be LLM-friendly for exploring and analyzing large heap dumps.
+A streaming Rust library and CLI tool for parsing Java HPROF heap dumps with constant memory usage. Designed to be LLM-friendly for exploring and analyzing large heap dumps.
 
 ## Features
 
+- **Interactive CLI**: Command-line tool for exploring heap dumps interactively
 - **Streaming Parser**: Process heap dumps without loading the entire file into memory
 - **Constant Memory**: Designed to handle multi-gigabyte heap dumps efficiently
 - **LLM-Friendly API**: High-level `HeapExplorer` API for easy heap exploration
 - **Type-Safe**: Full type safety with Rust's type system
 - **Comprehensive**: Supports all HPROF record types and heap dump sub-records
+
+## Quick Start - CLI
+
+```bash
+# Build the CLI
+cargo build --release
+
+# Run the interactive explorer
+./target/release/hprof-parser java-test/heap-dump.hprof
+
+# Available commands:
+> help                           # Show all commands
+> stats                          # Show heap statistics
+> top 10                         # Show top 10 classes by instance count
+> classes String                 # Find classes matching 'String'
+> count java/lang/String         # Count instances of exact class
+> instances java/lang/String     # List all instances of class
+> quit                           # Exit
+```
 
 ## Project Structure
 
