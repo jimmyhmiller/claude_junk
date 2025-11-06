@@ -77,6 +77,15 @@ fn main() -> Result<()> {
                     show_count(&explorer, parts[1]);
                 }
             }
+            "roots" => {
+                if parts.len() < 2 {
+                    println!("Usage: roots <object-id-hex>");
+                } else {
+                    if let Err(e) = show_gc_roots(&explorer, parts[1]) {
+                        println!("Error: {}", e);
+                    }
+                }
+            }
             "stats" => {
                 let stats = explorer.get_statistics();
                 println!("{}", stats);
@@ -93,13 +102,14 @@ fn main() -> Result<()> {
 
 fn print_help() {
     println!("Available commands:");
-    println!("  help                    - Show this help");
-    println!("  stats                   - Show heap statistics");
-    println!("  classes <pattern>       - Find classes matching pattern");
-    println!("  top [n]                 - Show top N classes by instance count (default 10)");
-    println!("  count <class-name>      - Show instance count for exact class name");
-    println!("  instances <class-name>  - List all instances of exact class name");
-    println!("  quit, exit              - Exit the program");
+    println!("  help                     - Show this help");
+    println!("  stats                    - Show heap statistics");
+    println!("  classes <pattern>        - Find classes matching pattern");
+    println!("  top [n]                  - Show top N classes by instance count (default 10)");
+    println!("  count <class-name>       - Show instance count for exact class name");
+    println!("  instances <class-name>   - List all instances of exact class name");
+    println!("  roots <object-id-hex>    - Show GC root paths for an object");
+    println!("  quit, exit               - Exit the program");
 }
 
 fn list_classes(explorer: &HeapExplorer, pattern: &str) {
@@ -151,6 +161,42 @@ fn show_instances(explorer: &HeapExplorer, class_name: &str) -> Result<()> {
     } else {
         println!("Class not found: {}", class_name);
         println!("Try: classes {}", class_name);
+    }
+
+    Ok(())
+}
+
+fn show_gc_roots(explorer: &HeapExplorer, object_id_str: &str) -> Result<()> {
+    // Parse hex object ID
+    let object_id = u64::from_str_radix(object_id_str, 16)
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Invalid hex object ID")
+        })?;
+
+    println!("Finding GC root paths for object {:x}...", object_id);
+    println!("(max 5 paths, max depth 20)\n");
+
+    let paths = explorer.find_gc_root_paths(object_id, 5, 20)?;
+
+    if paths.is_empty() {
+        println!("No paths to GC roots found.");
+        println!("This object may be unreachable (eligible for garbage collection).");
+    } else {
+        println!("Found {} path(s) to GC roots:\n", paths.len());
+
+        for (i, path) in paths.iter().enumerate() {
+            println!("Path {}:", i + 1);
+            for (j, (obj_id, desc)) in path.iter().enumerate() {
+                if j == 0 {
+                    println!("  {:x} (target)", obj_id);
+                } else if j == path.len() - 1 {
+                    println!("  └─> {:x} [GC ROOT]", obj_id);
+                } else {
+                    println!("  └─> {:x} via {}", obj_id, desc);
+                }
+            }
+            println!();
+        }
     }
 
     Ok(())

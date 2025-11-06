@@ -49,3 +49,7 @@ path = "examples/scan_records.rs"
 [[example]]
 name = "profile_scan"
 path = "examples/profile_scan.rs"
+
+[[example]]
+name = "gc_roots"
+path = "examples/gc_roots.rs"

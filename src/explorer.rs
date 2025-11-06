@@ -334,6 +334,157 @@ impl HeapExplorer {
             })
             .collect()
     }
+
+    /// Find all objects that reference the given object ID
+    /// Returns a vector of (referrer_object_id, description) tuples
+    pub fn find_references_to(&self, target_id: ObjectId) -> Result<Vec<(ObjectId, String)>> {
+        let mut references = Vec::new();
+        let file = File::open(&self.file_path)?;
+        let mut parser = HprofParser::new(file)?;
+        let id_size = self.header.id_size as usize;
+
+        while let Some(record) = parser.next_record()? {
+            match record {
+                Record::InstanceDump {
+                    object_id,
+                    class_object_id,
+                    data,
+                    ..
+                } => {
+                    // Check if any field references the target
+                    if let Some(class_info) = self.classes.get(&class_object_id) {
+                        let mut offset = 0usize;
+                        for field in &class_info.instance_fields {
+                            let field_size = field.field_type.size(self.header.id_size) as usize;
+                            if offset + field_size > data.len() {
+                                break;
+                            }
+
+                            if field.field_type == PrimitiveType::Object {
+                                let field_id = read_id(&data[offset..], id_size);
+                                if field_id == target_id {
+                                    let field_name = self.strings.get(&field.name_id)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("?");
+                                    let class_name = self.get_class_name(class_object_id)
+                                        .unwrap_or("Unknown");
+                                    references.push((object_id,
+                                        format!("{}.{}", class_name, field_name)));
+                                }
+                            }
+                            offset += field_size;
+                        }
+                    }
+                }
+                Record::ObjectArrayDump {
+                    object_id,
+                    elements,
+                    ..
+                } => {
+                    // Check if any array element references the target
+                    for (i, &elem_id) in elements.iter().enumerate() {
+                        if elem_id == target_id {
+                            references.push((object_id, format!("array[{}]", i)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(references)
+    }
+
+    /// Find paths from an object to GC roots
+    /// Returns a list of paths, where each path is a list of (object_id, description)
+    /// Limited to max_paths paths and max_depth depth
+    pub fn find_gc_root_paths(
+        &self,
+        target_id: ObjectId,
+        max_paths: usize,
+        max_depth: usize,
+    ) -> Result<Vec<Vec<(ObjectId, String)>>> {
+        use std::collections::{HashSet, VecDeque};
+
+        // Check if target is itself a GC root
+        let root_ids: HashSet<ObjectId> = self.roots.iter()
+            .map(|r| match r {
+                RootType::Unknown { object_id } => *object_id,
+                RootType::JniGlobal { object_id, .. } => *object_id,
+                RootType::JniLocal { object_id, .. } => *object_id,
+                RootType::JavaFrame { object_id, .. } => *object_id,
+                RootType::NativeStack { object_id, .. } => *object_id,
+                RootType::StickyClass { object_id } => *object_id,
+                RootType::ThreadBlock { object_id, .. } => *object_id,
+                RootType::MonitorUsed { object_id } => *object_id,
+                RootType::ThreadObject { object_id, .. } => *object_id,
+            })
+            .collect();
+
+        if root_ids.contains(&target_id) {
+            return Ok(vec![vec![(target_id, "GC Root".to_string())]]);
+        }
+
+        // BFS to find paths from target to any GC root
+        let mut paths = Vec::new();
+        let mut queue: VecDeque<(ObjectId, Vec<(ObjectId, String)>)> = VecDeque::new();
+        let mut visited = HashSet::new();
+
+        queue.push_back((target_id, vec![(target_id, "target".to_string())]));
+        visited.insert(target_id);
+
+        while let Some((current_id, path)) = queue.pop_front() {
+            if path.len() > max_depth {
+                continue;
+            }
+
+            // Check if current object is a GC root
+            if root_ids.contains(&current_id) && current_id != target_id {
+                paths.push(path.clone());
+                if paths.len() >= max_paths {
+                    break;
+                }
+                continue;
+            }
+
+            // Find objects that reference current
+            let refs = self.find_references_to(current_id)?;
+            for (ref_id, desc) in refs {
+                if !visited.contains(&ref_id) {
+                    visited.insert(ref_id);
+                    let mut new_path = path.clone();
+                    new_path.push((ref_id, desc));
+                    queue.push_back((ref_id, new_path));
+                }
+            }
+        }
+
+        Ok(paths)
+    }
+}
+
+// Helper function to read an object ID from a byte slice
+fn read_id(data: &[u8], id_size: usize) -> ObjectId {
+    match id_size {
+        4 => {
+            if data.len() >= 4 {
+                u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64
+            } else {
+                0
+            }
+        }
+        8 => {
+            if data.len() >= 8 {
+                u64::from_be_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ])
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone)]
