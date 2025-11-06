@@ -53,3 +53,11 @@ path = "examples/profile_scan.rs"
 [[example]]
 name = "gc_roots"
 path = "examples/gc_roots.rs"
+
+[[example]]
+name = "field_extraction"
+path = "examples/field_extraction.rs"
+
+[[example]]
+name = "debug_field_extraction"
+path = "examples/debug_field_extraction.rs"

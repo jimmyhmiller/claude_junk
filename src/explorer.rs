@@ -6,6 +6,50 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+/// Represents a field value extracted from an instance
+#[derive(Debug, Clone)]
+pub enum FieldValue {
+    Object(ObjectId),
+    Boolean(bool),
+    Char(u16),
+    Float(f32),
+    Double(f64),
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Long(i64),
+}
+
+impl FieldValue {
+    pub fn as_object(&self) -> Option<ObjectId> {
+        match self {
+            FieldValue::Object(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub fn as_int(&self) -> Option<i32> {
+        match self {
+            FieldValue::Int(val) => Some(*val),
+            _ => None,
+        }
+    }
+
+    pub fn as_long(&self) -> Option<i64> {
+        match self {
+            FieldValue::Long(val) => Some(*val),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            FieldValue::Boolean(val) => Some(*val),
+            _ => None,
+        }
+    }
+}
+
 /// High-level API for exploring heap dumps
 /// Designed to be LLM-friendly with simple queries
 ///
@@ -460,6 +504,125 @@ impl HeapExplorer {
         }
 
         Ok(paths)
+    }
+
+    /// Extract a field value from an instance by field index
+    /// Field index is based on instance_fields from the class
+    pub fn get_field_value(&self, instance: &InstanceInfo, field_index: usize) -> Result<FieldValue> {
+        let class_info = self.classes.get(&instance.class_object_id)
+            .ok_or_else(|| crate::error::HprofError::InvalidRecord("Class not found".to_string()))?;
+
+        if field_index >= class_info.instance_fields.len() {
+            return Err(crate::error::HprofError::InvalidRecord("Field index out of bounds".to_string()));
+        }
+
+        let field = &class_info.instance_fields[field_index];
+        let id_size = self.header.id_size as usize;
+
+        // Calculate offset to this field
+        let mut offset = 0usize;
+        for i in 0..field_index {
+            offset += class_info.instance_fields[i].field_type.size(self.header.id_size) as usize;
+        }
+
+        let field_size = field.field_type.size(self.header.id_size) as usize;
+        if offset + field_size > instance.data.len() {
+            return Err(crate::error::HprofError::InvalidRecord("Field data out of bounds".to_string()));
+        }
+
+        let field_data = &instance.data[offset..offset + field_size];
+
+        // Parse based on field type
+        let value = match field.field_type {
+            PrimitiveType::Object => FieldValue::Object(read_id(field_data, id_size)),
+            PrimitiveType::Boolean => FieldValue::Boolean(field_data[0] != 0),
+            PrimitiveType::Char => FieldValue::Char(u16::from_be_bytes([field_data[0], field_data[1]])),
+            PrimitiveType::Float => FieldValue::Float(f32::from_be_bytes([
+                field_data[0], field_data[1], field_data[2], field_data[3]
+            ])),
+            PrimitiveType::Double => FieldValue::Double(f64::from_be_bytes([
+                field_data[0], field_data[1], field_data[2], field_data[3],
+                field_data[4], field_data[5], field_data[6], field_data[7],
+            ])),
+            PrimitiveType::Byte => FieldValue::Byte(field_data[0] as i8),
+            PrimitiveType::Short => FieldValue::Short(i16::from_be_bytes([field_data[0], field_data[1]])),
+            PrimitiveType::Int => FieldValue::Int(i32::from_be_bytes([
+                field_data[0], field_data[1], field_data[2], field_data[3]
+            ])),
+            PrimitiveType::Long => FieldValue::Long(i64::from_be_bytes([
+                field_data[0], field_data[1], field_data[2], field_data[3],
+                field_data[4], field_data[5], field_data[6], field_data[7],
+            ])),
+        };
+
+        Ok(value)
+    }
+
+    /// Extract String value from a java/lang/String instance
+    /// Returns None if the instance is not a String or if extraction fails
+    pub fn extract_string_value(&self, instance: &InstanceInfo) -> Result<Option<String>> {
+        // Check if this is a java/lang/String instance
+        let class_name = self.get_class_name(instance.class_object_id);
+        if class_name.as_deref() != Some("java/lang/String") {
+            return Ok(None);
+        }
+
+        // Java String fields (order may vary by JDK version, but typically):
+        // - value: byte[] or char[] (field 0)
+        // - coder: byte (field 1 in Java 9+, indicates Latin1 vs UTF16)
+        // - hash: int
+
+        // Get the 'value' field (should be index 0)
+        if let Ok(FieldValue::Object(value_array_id)) = self.get_field_value(instance, 0) {
+            if value_array_id == 0 {
+                return Ok(Some(String::new())); // null or empty
+            }
+
+            // Scan for the byte[] or char[] array (arrays are PrimitiveArrayDump, not InstanceDump)
+            return Ok(Some(self.decode_string_array(value_array_id)?));
+        }
+
+        Ok(None)
+    }
+
+    /// Decode a byte[] or char[] array into a String by scanning for the array ID
+    fn decode_string_array(&self, array_id: ObjectId) -> Result<String> {
+        let file = File::open(&self.file_path)?;
+        let mut parser = HprofParser::new(file)?;
+
+        while let Some(record) = parser.next_record()? {
+            match record {
+                Record::PrimitiveArrayDump {
+                    object_id,
+                    element_type,
+                    elements,
+                    ..
+                } if object_id == array_id => {
+                    // byte[] array (Java 9+ compact strings)
+                    if element_type == PrimitiveType::Byte {
+                        // Treat as Latin1/UTF-8
+                        let bytes: Vec<u8> = elements.iter().map(|&b| b as u8).collect();
+                        return Ok(String::from_utf8_lossy(&bytes).to_string());
+                    }
+                    // char[] array (older Java or non-Latin1 strings)
+                    else if element_type == PrimitiveType::Char {
+                        let chars: Vec<u16> = elements.chunks(2)
+                            .filter_map(|chunk| {
+                                if chunk.len() == 2 {
+                                    Some(u16::from_be_bytes([chunk[0] as u8, chunk[1] as u8]))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        return Ok(String::from_utf16_lossy(&chars));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(String::new())
     }
 }
 
