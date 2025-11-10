@@ -83,6 +83,12 @@ pub struct InstanceInfo {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectArrayInfo {
+    pub object_id: ObjectId,
+    pub elements: Vec<ObjectId>,
+}
+
 impl HeapExplorer {
     /// Create a new heap explorer from a file path
     /// Does an initial scan to build metadata (classes, strings, counts)
@@ -556,6 +562,31 @@ impl HeapExplorer {
         };
 
         Ok(value)
+    }
+
+    /// Get object array by ID
+    /// Returns None if not found or not an object array
+    pub fn get_object_array(&self, array_id: ObjectId) -> Result<Option<ObjectArrayInfo>> {
+        // Scan through records to find the object array
+        let file = std::fs::File::open(&self.file_path)?;
+        let mut parser = crate::parser::HprofParser::new(file)?;
+
+        while let Some(record) = parser.next_record()? {
+            if let Record::ObjectArrayDump {
+                object_id,
+                elements,
+                ..
+            } = record {
+                if object_id == array_id {
+                    return Ok(Some(ObjectArrayInfo {
+                        object_id,
+                        elements,
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Extract String value from a java/lang/String instance

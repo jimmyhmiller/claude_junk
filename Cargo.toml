@@ -7,6 +7,8 @@ description = "A streaming parser for Java HPROF heap dumps"
 license = "MIT"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 

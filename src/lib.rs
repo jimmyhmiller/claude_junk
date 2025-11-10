@@ -26,9 +26,11 @@ pub mod parser;
 pub mod record;
 pub mod types;
 pub mod explorer;
+pub mod protocol;
+pub mod server;
 
 pub use error::{HprofError, Result};
 pub use parser::HprofParser;
 pub use record::Record;
 pub use types::*;
-pub use explorer::{HeapExplorer, FieldValue};
+pub use explorer::{HeapExplorer, FieldValue, InstanceInfo, ObjectArrayInfo};
