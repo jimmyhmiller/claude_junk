@@ -1,342 +1,318 @@
+mod gc_runtime;
+mod stackmap;
+
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Linkage;
+use inkwell::targets::{
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+};
 use inkwell::AddressSpace;
+use inkwell::OptimizationLevel;
+use object::{Object, ObjectSection};
+use std::path::Path;
 
-/// Demonstrates LLVM statepoint-based GC with inkwell
-///
-/// Key finding: inkwell doesn't support LLVM's `token` type directly,
-/// which is what gc.statepoint returns. So we have two approaches:
-///
-/// 1. Use RewriteStatepointsForGC pass (recommended) - write "abstract" IR
-///    with regular calls, and let the pass transform them to statepoints
-///
-/// 2. Use llvm-sys directly for the statepoint calls (more complex)
-///
-/// This demo uses approach #1: the pass-based workflow
+/// Demonstrates LLVM statepoint-based GC with inkwell and a real GC runtime
 
 fn main() {
-    println!("=== LLVM Statepoints with Inkwell ===\n");
+    println!("=== LLVM Statepoints + Real GC Runtime Demo ===\n");
 
-    // Check intrinsic availability
-    check_intrinsics();
+    // First, let's test the GC runtime standalone
+    test_gc_runtime_standalone();
 
-    // Demonstrate the abstract machine model approach
-    let lowered_ir = demonstrate_abstract_machine_model();
-
-    // Generate object code with stack maps
-    if lowered_ir.is_some() {
-        generate_object_with_stackmaps();
-    }
+    // Then generate and test with LLVM statepoints
+    test_with_statepoints();
 }
 
-fn check_intrinsics() {
-    println!("=== Checking GC Intrinsics ===\n");
+/// Test the GC runtime without LLVM - proves the GC mechanics work
+fn test_gc_runtime_standalone() {
+    println!("\n========================================");
+    println!("Part 1: Testing GC Runtime (standalone)");
+    println!("========================================\n");
 
-    let intrinsics = [
-        "llvm.experimental.gc.statepoint",
-        "llvm.experimental.gc.result",
-        "llvm.experimental.gc.relocate",
+    // Initialize GC
+    gc_runtime::gc_init();
+
+    // Simulate what LLVM-generated code would do:
+    // Allocate some objects and keep them as "roots" on our stack
+
+    // Allocate obj1
+    let obj1: *mut u8 = gc_runtime::gc_alloc(64);
+    println!("Allocated obj1 at {:p}", obj1);
+
+    // Write some data to obj1
+    unsafe {
+        *(obj1 as *mut u64) = 0xDEAD_BEEF_CAFE_BABE;
+    }
+
+    // Allocate obj2 (simulates a safepoint call)
+    let obj2: *mut u8 = gc_runtime::gc_alloc(64);
+    println!("Allocated obj2 at {:p}", obj2);
+
+    unsafe {
+        *(obj2 as *mut u64) = 0x1234_5678_9ABC_DEF0;
+    }
+
+    // Allocate obj3
+    let obj3: *mut u8 = gc_runtime::gc_alloc(128);
+    println!("Allocated obj3 at {:p}", obj3);
+
+    // Now trigger a GC!
+    // In real statepoint code, the runtime would find roots via stack maps.
+    // Here, we'll manually pass them.
+
+    println!("\n--- Triggering GC ---");
+    println!("Before GC:");
+    println!("  obj1 = {:p} (data: {:#x})", obj1, unsafe {
+        *(obj1 as *const u64)
+    });
+    println!("  obj2 = {:p} (data: {:#x})", obj2, unsafe {
+        *(obj2 as *const u64)
+    });
+    println!("  obj3 = {:p}", obj3);
+
+    // Create mutable root slots (this is what the stack would look like)
+    let mut root1 = obj1;
+    let mut root2 = obj2;
+    let mut root3 = obj3;
+
+    // Collect garbage with our roots
+    let mut roots: [*mut *mut u8; 3] = [
+        &mut root1 as *mut *mut u8,
+        &mut root2 as *mut *mut u8,
+        &mut root3 as *mut *mut u8,
     ];
 
-    for name in &intrinsics {
-        match Intrinsic::find(name) {
-            Some(i) => println!("✓ {}: overloaded={}", name, i.is_overloaded()),
-            None => println!("✗ {} not found", name),
+    unsafe {
+        if let Some(gc) = &mut gc_runtime::GC {
+            gc.collect(&mut roots.iter().map(|r| *r).collect::<Vec<_>>());
         }
     }
 
-    println!();
-    println!("NOTE: inkwell doesn't support LLVM's `token` type, which gc.statepoint returns.");
-    println!("      We'll use RewriteStatepointsForGC pass instead of manual construction.\n");
+    println!("\nAfter GC:");
+    println!("  root1 = {:p} (was {:p})", root1, obj1);
+    println!("  root2 = {:p} (was {:p})", root2, obj2);
+    println!("  root3 = {:p} (was {:p})", root3, obj3);
+
+    // Verify the data was preserved!
+    println!("\nVerifying data integrity:");
+    let data1 = unsafe { *(root1 as *const u64) };
+    let data2 = unsafe { *(root2 as *const u64) };
+    println!("  root1 data: {:#x} (expected: 0xDEAD_BEEF_CAFE_BABE)", data1);
+    println!("  root2 data: {:#x} (expected: 0x1234_5678_9ABC_DEF0)", data2);
+
+    if data1 == 0xDEAD_BEEF_CAFE_BABE && data2 == 0x1234_5678_9ABC_DEF0 {
+        println!("\n✓ SUCCESS: Data survived GC and relocation!");
+        if root1 != obj1 {
+            println!("✓ Objects were actually MOVED (root1: {:p} -> {:p})", obj1, root1);
+        }
+    } else {
+        println!("\n✗ FAILURE: Data corruption after GC!");
+    }
+
+    gc_runtime::gc_stats();
 }
 
-/// Build IR in the "abstract machine model" - regular calls that the pass transforms
-fn demonstrate_abstract_machine_model() -> Option<String> {
-    println!("=== Building Abstract Machine Model IR ===\n");
+/// Test with actual LLVM statepoints
+fn test_with_statepoints() {
+    println!("\n\n========================================");
+    println!("Part 2: LLVM Statepoints Integration");
+    println!("========================================\n");
+
+    // Generate the IR
+    let (module_ir, object_path) = generate_statepoint_code();
+
+    // Parse the stack maps from the object file
+    if let Some(path) = object_path {
+        parse_and_show_stackmaps(&path);
+    }
+}
+
+fn generate_statepoint_code() -> (String, Option<String>) {
+    println!("Generating IR with statepoints...\n");
 
     let context = Context::create();
-    let module = context.create_module("gc_demo");
+    let module = context.create_module("gc_test");
     let builder = context.create_builder();
 
     let i64_type = context.i64_type();
-    let i32_type = context.i32_type();
-    let gc_ptr_type = context.ptr_type(AddressSpace::from(1)); // GC pointers in addrspace 1
+    let gc_ptr_type = context.ptr_type(AddressSpace::from(1));
 
-    // External GC allocator
+    // Declare external GC functions
     let alloc_fn_type = gc_ptr_type.fn_type(&[i64_type.into()], false);
     let alloc_fn = module.add_function("gc_alloc", alloc_fn_type, Some(Linkage::External));
 
-    // A function to use an object (forces it to stay live)
-    let use_fn_type = context.void_type().fn_type(&[gc_ptr_type.into()], false);
-    let use_fn = module.add_function("use_object", use_fn_type, Some(Linkage::External));
+    // Create a test function
+    let fn_type = i64_type.fn_type(&[], false);
+    let function = module.add_function("gc_test_function", fn_type, None);
+    function.set_gc("statepoint-example");
 
-    // =========================================================================
-    // Example 1: Simple case - GC pointer live across a call
-    // =========================================================================
-    {
-        let fn_type = i64_type.fn_type(&[], false);
-        let function = module.add_function("simple_gc_example", fn_type, None);
-        function.set_gc("statepoint-example");
+    let entry = context.append_basic_block(function, "entry");
+    builder.position_at_end(entry);
 
-        let entry = context.append_basic_block(function, "entry");
-        builder.position_at_end(entry);
+    // Allocate and use objects
+    let size = i64_type.const_int(64, false);
 
-        // Allocate first object
-        let size = i64_type.const_int(64, false);
-        let obj1 = builder
-            .build_call(alloc_fn, &[size.into()], "obj1")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
+    // obj1 = gc_alloc(64)
+    let obj1 = builder
+        .build_call(alloc_fn, &[size.into()], "obj1")
+        .unwrap()
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_pointer_value();
 
-        // This call is a potential safepoint - GC might move obj1!
-        let _obj2 = builder.build_call(alloc_fn, &[size.into()], "obj2").unwrap();
+    // Store a value in obj1
+    let magic = i64_type.const_int(0xCAFEBABE, false);
+    builder.build_store(obj1, magic).unwrap();
 
-        // Use obj1 after the potential GC
-        // The pass will insert gc.relocate to get the new address
-        builder.build_call(use_fn, &[obj1.into()], "").unwrap();
+    // obj2 = gc_alloc(64) -- this is a safepoint, obj1 must be relocated
+    let _obj2 = builder.build_call(alloc_fn, &[size.into()], "obj2").unwrap();
 
-        let val = builder.build_load(i64_type, obj1, "val").unwrap();
-        builder.build_return(Some(&val)).unwrap();
-    }
-
-    // =========================================================================
-    // Example 2: Loop with GC allocations
-    // =========================================================================
-    {
-        let fn_type = context.void_type().fn_type(&[i32_type.into()], false);
-        let function = module.add_function("loop_gc_example", fn_type, None);
-        function.set_gc("statepoint-example");
-
-        let entry = context.append_basic_block(function, "entry");
-        let loop_header = context.append_basic_block(function, "loop.header");
-        let loop_body = context.append_basic_block(function, "loop.body");
-        let exit = context.append_basic_block(function, "exit");
-
-        // Entry: allocate initial object
-        builder.position_at_end(entry);
-        let n = function.get_first_param().unwrap().into_int_value();
-        let size = i64_type.const_int(32, false);
-        let initial_obj = builder
-            .build_call(alloc_fn, &[size.into()], "initial_obj")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
-        let zero = i32_type.const_int(0, false);
-        builder.build_unconditional_branch(loop_header).unwrap();
-
-        // Loop header: phi nodes for counter and object
-        builder.position_at_end(loop_header);
-        let i_phi = builder.build_phi(i32_type, "i").unwrap();
-        let obj_phi = builder.build_phi(gc_ptr_type, "obj").unwrap();
-        i_phi.add_incoming(&[(&zero, entry)]);
-        obj_phi.add_incoming(&[(&initial_obj, entry)]);
-
-        let i_val = i_phi.as_basic_value().into_int_value();
-        let cond = builder
-            .build_int_compare(inkwell::IntPredicate::SLT, i_val, n, "cond")
-            .unwrap();
-        builder
-            .build_conditional_branch(cond, loop_body, exit)
-            .unwrap();
-
-        // Loop body: use current object, allocate new one
-        builder.position_at_end(loop_body);
-        let current_obj = obj_phi.as_basic_value().into_pointer_value();
-
-        // Use the object - forces it to be live
-        builder.build_call(use_fn, &[current_obj.into()], "").unwrap();
-
-        // Allocate new object (safepoint!) - current_obj might move
-        let new_obj = builder
-            .build_call(alloc_fn, &[size.into()], "new_obj")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
-
-        let one = i32_type.const_int(1, false);
-        let i_next = builder.build_int_add(i_val, one, "i.next").unwrap();
-        builder.build_unconditional_branch(loop_header).unwrap();
-
-        i_phi.add_incoming(&[(&i_next, loop_body)]);
-        obj_phi.add_incoming(&[(&new_obj, loop_body)]);
-
-        // Exit
-        builder.position_at_end(exit);
-        builder.build_return(None).unwrap();
-    }
-
-    // =========================================================================
-    // Example 3: Multiple live pointers
-    // =========================================================================
-    {
-        let fn_type = i64_type.fn_type(&[], false);
-        let function = module.add_function("multi_pointer_example", fn_type, None);
-        function.set_gc("statepoint-example");
-
-        let entry = context.append_basic_block(function, "entry");
-        builder.position_at_end(entry);
-
-        let size = i64_type.const_int(64, false);
-
-        // Allocate three objects
-        let obj1 = builder
-            .build_call(alloc_fn, &[size.into()], "obj1")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
-
-        let obj2 = builder
-            .build_call(alloc_fn, &[size.into()], "obj2")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
-
-        let obj3 = builder
-            .build_call(alloc_fn, &[size.into()], "obj3")
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value();
-
-        // All three pointers are live across this call
-        // The pass must insert relocates for all of them
-        let _obj4 = builder.build_call(alloc_fn, &[size.into()], "obj4").unwrap();
-
-        // Use all three
-        let v1 = builder.build_load(i64_type, obj1, "v1").unwrap();
-        let v2 = builder.build_load(i64_type, obj2, "v2").unwrap();
-        let v3 = builder.build_load(i64_type, obj3, "v3").unwrap();
-
-        let sum1 = builder
-            .build_int_add(v1.into_int_value(), v2.into_int_value(), "sum1")
-            .unwrap();
-        let sum2 = builder.build_int_add(sum1, v3.into_int_value(), "sum2").unwrap();
-
-        builder.build_return(Some(&sum2)).unwrap();
-    }
+    // Load from obj1 (after potential GC - the pass will fix this)
+    let val = builder.build_load(i64_type, obj1, "val").unwrap();
+    builder.build_return(Some(&val)).unwrap();
 
     let ir = module.print_to_string().to_string();
-    println!("Generated IR (abstract model):\n{}", ir);
+    println!("Abstract IR (before statepoint pass):\n{}\n", ir);
 
     // Write to file
-    module.print_to_file("abstract_gc.ll").unwrap();
-    println!("Written to abstract_gc.ll\n");
+    module.print_to_file("gc_test_abstract.ll").unwrap();
 
-    // Run the RewriteStatepointsForGC pass
-    println!("=== Running RewriteStatepointsForGC Pass ===\n");
+    // Run RewriteStatepointsForGC pass
+    println!("Running RewriteStatepointsForGC pass...\n");
 
-    run_rewrite_statepoints_pass()
-}
-
-fn run_rewrite_statepoints_pass() -> Option<String> {
-    let output = std::process::Command::new("opt")
-        .args(["-passes=rewrite-statepoints-for-gc", "abstract_gc.ll", "-S"])
+    let opt_result = std::process::Command::new("opt")
+        .args([
+            "-passes=rewrite-statepoints-for-gc",
+            "gc_test_abstract.ll",
+            "-S",
+            "-o",
+            "gc_test_lowered.ll",
+        ])
         .output();
 
-    match output {
-        Ok(result) => {
-            if result.status.success() {
-                let ir = String::from_utf8_lossy(&result.stdout).to_string();
-                println!("Transformed IR (with statepoints):\n{}", ir);
-                std::fs::write("lowered_gc.ll", &ir).unwrap();
-                println!("Written to lowered_gc.ll\n");
-                Some(ir)
-            } else {
-                println!("opt failed: {}", String::from_utf8_lossy(&result.stderr));
-                None
+    match opt_result {
+        Ok(result) if result.status.success() => {
+            let lowered = std::fs::read_to_string("gc_test_lowered.ll").unwrap();
+            println!("Lowered IR (with statepoints):\n{}\n", lowered);
+
+            // Compile to object file
+            println!("Compiling to object file...\n");
+
+            let llc_result = std::process::Command::new("llc")
+                .args([
+                    "-filetype=obj",
+                    "-relocation-model=pic",
+                    "gc_test_lowered.ll",
+                    "-o",
+                    "gc_test.o",
+                ])
+                .output();
+
+            match llc_result {
+                Ok(r) if r.status.success() => {
+                    println!("Generated gc_test.o\n");
+                    return (ir, Some("gc_test.o".to_string()));
+                }
+                Ok(r) => {
+                    println!("llc failed: {}", String::from_utf8_lossy(&r.stderr));
+                }
+                Err(e) => {
+                    println!("Failed to run llc: {}", e);
+                }
             }
+        }
+        Ok(result) => {
+            println!("opt failed: {}", String::from_utf8_lossy(&result.stderr));
         }
         Err(e) => {
             println!("Failed to run opt: {}", e);
-            None
         }
     }
+
+    (ir, None)
 }
 
-fn generate_object_with_stackmaps() {
-    println!("=== Generating Object Code with Stack Maps ===\n");
+fn parse_and_show_stackmaps(object_path: &str) {
+    println!("========================================");
+    println!("Parsing Stack Maps from {}", object_path);
+    println!("========================================\n");
 
-    // Compile to object file
-    let llc_output = std::process::Command::new("llc")
-        .args(["-filetype=obj", "lowered_gc.ll", "-o", "gc_demo.o"])
-        .output();
+    let data = std::fs::read(object_path).expect("Failed to read object file");
+    let obj = object::File::parse(&*data).expect("Failed to parse object file");
 
-    match llc_output {
-        Ok(result) => {
-            if result.status.success() {
-                println!("Generated gc_demo.o");
+    // Find the .llvm_stackmaps section
+    let stackmap_section = obj.sections().find(|s| {
+        s.name()
+            .map(|n| n == ".llvm_stackmaps")
+            .unwrap_or(false)
+    });
 
-                // Read stack maps
-                println!("\n=== Stack Map Contents ===\n");
-                let readobj_output = std::process::Command::new("llvm-readobj")
-                    .args(["--stackmap", "gc_demo.o"])
-                    .output();
+    match stackmap_section {
+        Some(section) => {
+            let section_data = section.data().expect("Failed to read section data");
+            println!(
+                "Found .llvm_stackmaps section: {} bytes\n",
+                section_data.len()
+            );
 
-                match readobj_output {
-                    Ok(res) => {
-                        if res.status.success() {
-                            println!("{}", String::from_utf8_lossy(&res.stdout));
-                        } else {
-                            // Try alternate tools
-                            let readelf_output = std::process::Command::new("readelf")
-                                .args(["-x", ".llvm_stackmaps", "gc_demo.o"])
-                                .output();
+            match stackmap::StackMap::parse(section_data) {
+                Ok(stackmap) => {
+                    println!("Stack Map Version: {}", stackmap.header.version);
+                    println!("Functions: {}", stackmap.header.num_functions);
+                    println!("Records: {}", stackmap.header.num_records);
+                    println!();
 
-                            match readelf_output {
-                                Ok(r) => {
-                                    if r.status.success() {
-                                        println!("Raw .llvm_stackmaps section:");
-                                        println!("{}", String::from_utf8_lossy(&r.stdout));
-                                    } else {
-                                        println!("No stack maps found or error reading");
-                                    }
-                                }
-                                Err(e) => println!("readelf failed: {}", e),
+                    for (i, func) in stackmap.functions.iter().enumerate() {
+                        println!(
+                            "Function {}: addr={:#x}, stack_size={}, records={}",
+                            i, func.address, func.stack_size, func.record_count
+                        );
+                    }
+                    println!();
+
+                    for (i, record) in stackmap.records.iter().enumerate() {
+                        println!(
+                            "Record {}: id={}, offset={}, {} locations",
+                            i,
+                            record.id,
+                            record.instruction_offset,
+                            record.locations.len()
+                        );
+
+                        let gc_locs = stackmap.get_gc_locations(record);
+                        if !gc_locs.is_empty() {
+                            println!("  GC pointer locations:");
+                            for (base, derived) in &gc_locs {
+                                println!("    base: {}, derived: {}", base, derived);
                             }
                         }
                     }
-                    Err(e) => println!("llvm-readobj failed: {}", e),
+
+                    println!("\n✓ Stack maps parsed successfully!");
+                    println!("  These tell the GC exactly where to find live pointers");
+                    println!("  at each safepoint (call instruction).\n");
                 }
-            } else {
-                println!("llc failed: {}", String::from_utf8_lossy(&result.stderr));
+                Err(e) => {
+                    println!("Failed to parse stack map: {}", e);
+                }
             }
         }
-        Err(e) => println!("Failed to run llc: {}", e),
+        None => {
+            println!("No .llvm_stackmaps section found!");
+        }
     }
 
-    // Also generate assembly to see the actual code
-    println!("\n=== Generated Assembly (excerpt) ===\n");
-    let llc_asm = std::process::Command::new("llc")
-        .args(["lowered_gc.ll", "-o", "-"])
+    // Show raw llvm-readobj output too
+    println!("\n--- llvm-readobj --stackmap output ---\n");
+    let readobj = std::process::Command::new("llvm-readobj")
+        .args(["--stackmap", object_path])
         .output();
 
-    match llc_asm {
-        Ok(result) => {
-            if result.status.success() {
-                let asm = String::from_utf8_lossy(&result.stdout);
-                // Print first 100 lines
-                for (i, line) in asm.lines().enumerate() {
-                    if i > 100 {
-                        println!("... (truncated)");
-                        break;
-                    }
-                    println!("{}", line);
-                }
-            }
+    if let Ok(result) = readobj {
+        if result.status.success() {
+            println!("{}", String::from_utf8_lossy(&result.stdout));
         }
-        Err(_) => {}
     }
 }
