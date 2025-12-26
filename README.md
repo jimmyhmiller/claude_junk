@@ -1,80 +1,126 @@
-# agile
+# Agile Tools Suite
 
-CLI agile tools for small teams, designed for AI agent interaction.
+CLI agile tools for small teams, designed for AI agent interaction. Each tool is a separate binary that can be installed and billed independently.
 
-## Install
+## Architecture
 
-```bash
-cargo install --path .
+```
+┌─────────────────────────────────────────────────────────┐
+│              Individual CLI Tools                        │
+│  standup │ bug │ retro │ task │ decision │ note │ etc  │
+├─────────────────────────────────────────────────────────┤
+│                    agile-core                            │
+│         (sync, storage, types, auth)                     │
+├──────────┬──────────┬──────────────────────────────────┤
+│  Local   │   HTTP   │   Git (planned)                   │
+│  Sync    │   Sync   │   Sync                            │
+└──────────┴──────────┴──────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                   agile-server                           │
+│      (REST API, PostgreSQL, JWT auth, teams)            │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## Usage
+## Tools
 
-Initialize in your project:
-```bash
-agile init
-```
+| Binary | Description | Install |
+|--------|-------------|---------|
+| `standup` | Daily standups - yesterday, today, blockers | `cargo install --path crates/standup` |
+| `bug` | Bug/issue tracking with priority & status | `cargo install --path crates/bug` |
+| `retro` | Retrospectives - good, bad, action items | `cargo install --path crates/retro` |
+| `task` | Kanban task management | `cargo install --path crates/task` |
+| `decision` | Architectural decision records (ADRs) | `cargo install --path crates/decision` |
+| `note` | Meeting notes and context | `cargo install --path crates/note` |
+| `review` | Code review request tracking | `cargo install --path crates/review` |
+| `kudos` | Team appreciation and wins | `cargo install --path crates/kudos` |
 
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `standup` | Daily standups - yesterday, today, blockers |
-| `bug` | Bug/issue tracking |
-| `retro` | Retrospectives - good, bad, action items |
-| `task` | Kanban task board |
-| `decision` | Architectural decision records |
-| `note` | Meeting notes and context |
-| `review` | Code review requests |
-| `kudos` | Team appreciation |
-
-### Examples
+## Quick Start
 
 ```bash
-# Standup
-agile standup add -y "Fixed auth bug" -t "Working on API" -b "Need design review"
-agile standup today
+# Install a tool
+cargo install --path crates/standup
 
-# Bugs
-agile bug new "Login fails on Safari" --priority high
-agile bug list --status open
-agile bug close abc123
+# Initialize
+standup init
 
-# Retro
-agile retro good "Shipped on time"
-agile retro bad "Too many meetings"
-agile retro action "Reduce meeting frequency" --owner alice
-
-# Tasks
-agile task add "Implement caching"
-agile task board
-agile task start abc123
-agile task done abc123
-
-# Decisions
-agile decision record "Use PostgreSQL" --decision "Need ACID guarantees" --context "Evaluated MySQL, PostgreSQL, MongoDB"
-
-# Notes
-agile note add "Sprint planning" --content "Discussed Q1 priorities" --tag planning
-
-# Reviews
-agile review request "Add user auth" --reviewer alice --reviewer bob
-agile review approve abc123
-
-# Kudos
-agile kudos give alice "Great job on the refactor!"
-agile kudos leaderboard
+# Use it
+standup add -y "Fixed auth bug" -t "Working on API"
+standup today --json
 ```
 
-### JSON Output
+## Sync
+
+Each tool supports syncing to a backend server:
+
+```bash
+# Login to sync service
+standup login --email you@example.com --password secret --server https://api.example.com
+
+# Sync changes
+standup sync
+
+# Check sync status
+standup status
+```
+
+## Server
+
+Run the backend server:
+
+```bash
+# Set environment variables
+export DATABASE_URL=postgres://localhost/agile
+export JWT_SECRET=your-secret-key
+
+# Run server
+cargo run --bin agile-server
+```
+
+### API Endpoints
+
+**Auth:**
+- `POST /api/v1/auth/register` - Register new user
+- `POST /api/v1/auth/login` - Login
+- `POST /api/v1/auth/refresh` - Refresh token
+- `GET /api/v1/auth/me` - Get current user
+
+**Teams:**
+- `POST /api/v1/teams` - Create team
+- `GET /api/v1/teams` - List teams
+- `GET /api/v1/teams/:id` - Get team
+- `POST /api/v1/teams/:id/members` - Add member
+- `GET /api/v1/teams/:id/members` - List members
+
+**Sync:**
+- `POST /api/v1/sync/push` - Push local changes
+- `GET /api/v1/sync/pull` - Pull remote changes
+- `GET /api/v1/sync/version` - Get current version
+
+## JSON Output
 
 All commands support `--json` for agent parsing:
 
 ```bash
-agile standup list --json
-agile bug list --json
+standup list --json
+bug list --json
+task board --json
 ```
 
 ## Storage
 
 Data is stored in `.agile/` in YAML format, designed to be git-friendly.
+
+## Development
+
+```bash
+# Build all
+cargo build
+
+# Run tests
+cargo test
+
+# Build release
+cargo build --release
+```

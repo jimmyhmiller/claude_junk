@@ -1,0 +1,27 @@
+[package]
+name = "agile-server"
+version.workspace = true
+edition.workspace = true
+description = "SaaS backend for agile tools"
+
+[[bin]]
+name = "agile-server"
+path = "src/main.rs"
+
+[dependencies]
+agile-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
