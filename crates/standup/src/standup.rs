@@ -200,6 +200,8 @@ pub async fn login(email: &str, password: &str, server: &str, json: bool) -> Res
         enabled: true,
         backend: SyncBackendType::Http,
         server_url: Some(server.to_string()),
+        git_remote: None,
+        git_branch: None,
         auto_sync: false,
     };
     config.save()?;

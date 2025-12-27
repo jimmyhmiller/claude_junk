@@ -58,6 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/sync/push", post(handlers::sync::push))
         .route("/api/v1/sync/pull", get(handlers::sync::pull))
         .route("/api/v1/sync/version", get(handlers::sync::version))
+        // Search routes
+        .route("/api/v1/search", get(handlers::search::search))
+        .route("/api/v1/search/bugs", get(handlers::search::search_bugs))
+        .route("/api/v1/search/tasks", get(handlers::search::search_tasks))
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

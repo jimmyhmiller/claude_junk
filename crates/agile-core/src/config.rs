@@ -20,6 +20,8 @@ pub struct SyncConfig {
     pub enabled: bool,
     pub backend: SyncBackendType,
     pub server_url: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
     pub auto_sync: bool,
 }
 
@@ -39,6 +41,8 @@ impl Default for Config {
                 enabled: false,
                 backend: SyncBackendType::Local,
                 server_url: None,
+                git_remote: None,
+                git_branch: None,
                 auto_sync: false,
             },
             team_id: None,

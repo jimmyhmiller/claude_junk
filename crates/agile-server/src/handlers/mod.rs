@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod search;
 pub mod sync;
 pub mod teams;
 

@@ -1,6 +1,8 @@
+mod git_backend;
 mod http_backend;
 mod local_backend;
 
+pub use git_backend::GitSyncBackend;
 pub use http_backend::HttpSyncBackend;
 pub use local_backend::LocalSyncBackend;
 
@@ -79,8 +81,9 @@ impl SyncManager {
                 Box::new(HttpSyncBackend::new(server_url.clone()))
             }
             SyncBackendType::Git => {
-                // TODO: Implement git backend
-                return Err(Error::Other("Git sync backend not yet implemented".into()));
+                let remote = config.sync.git_remote.clone().unwrap_or_else(|| "origin".into());
+                let branch = config.sync.git_branch.clone();
+                Box::new(GitSyncBackend::new(remote, branch))
             }
         };
         Ok(Self::new(backend))
