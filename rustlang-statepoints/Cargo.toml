@@ -1,0 +1,8 @@
+[package]
+name = "rustlang-statepoints"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inkwell = { path = "inkwell", features = ["llvm18-0"] }
+libc = "0.2"

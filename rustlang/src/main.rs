@@ -1,5 +1,10 @@
 mod gc_runtime;
 mod stackmap;
+mod tagged_value;
+mod shadow_stack;
+mod tagged_gc;
+mod dynamic_demo;
+mod jit_demo;
 
 use inkwell::context::Context;
 use inkwell::module::Linkage;
@@ -7,6 +12,35 @@ use inkwell::AddressSpace;
 use object::{Object, ObjectSection};
 
 fn main() {
+    // Check command line for which demo to run
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "dynamic" => {
+                dynamic_demo::run_demo();
+                return;
+            }
+            "jit" => {
+                jit_demo::run_demo();
+                return;
+            }
+            "all" => {
+                println!("=== LLVM Statepoints + GC Movement Demo ===\n");
+                demonstrate_gc_movement();
+                demonstrate_statepoints();
+
+                println!("\n\n");
+                dynamic_demo::run_demo();
+
+                println!("\n\n");
+                jit_demo::run_demo();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     println!("=== LLVM Statepoints + GC Movement Demo ===\n");
 
     // The clearest demonstration of GC movement
@@ -14,6 +48,13 @@ fn main() {
 
     // Then show LLVM statepoint integration
     demonstrate_statepoints();
+
+    println!("\n");
+    println!("Available demos:");
+    println!("  cargo run           # Basic GC movement demo");
+    println!("  cargo run dynamic   # Tagged pointer demo (educational)");
+    println!("  cargo run jit       # ** WORKING JIT with shadow stack GC **");
+    println!("  cargo run all       # Run all demos");
 }
 
 /// Crystal clear demonstration that GC actually moves objects
