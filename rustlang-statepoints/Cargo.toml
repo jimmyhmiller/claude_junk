@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-inkwell = { path = "inkwell", features = ["llvm18-0"] }
+inkwell = { git = "https://github.com/jimmyhmiller/inkwell.git", features = ["llvm18-1"] }
 libc = "0.2"
 mmtk = { version = "0.31", features = ["single_worker"] }
 log = "0.4"

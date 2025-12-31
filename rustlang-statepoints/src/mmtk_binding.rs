@@ -9,7 +9,6 @@
 use std::sync::{Mutex, OnceLock, Condvar};
 use std::thread::JoinHandle;
 
-use mmtk::util::alloc::AllocatorSelector;
 use mmtk::util::copy::{CopySemantics, GCWorkerCopyContext};
 use mmtk::util::{Address, ObjectReference};
 use mmtk::util::opaque_pointer::*;
@@ -55,15 +54,15 @@ pub fn mmtk() -> &'static MMTK<StatepointVM> {
     MMTK_INSTANCE.get().expect("MMTk not initialized")
 }
 
-/// Thread-local mutator - we store a raw pointer to avoid the borrowing issues
-/// Safety: The mutator is only accessed from the same thread, and it lives
-/// for the thread's lifetime
+// Thread-local mutator - we store a raw pointer to avoid the borrowing issues
+// Safety: The mutator is only accessed from the same thread, and it lives
+// for the thread's lifetime
 thread_local! {
     static MUTATOR: std::cell::Cell<Option<*mut Mutator<StatepointVM>>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Storage for the mutator box to keep it alive
+// Storage for the mutator box to keep it alive
 thread_local! {
     static MUTATOR_BOX: std::cell::RefCell<Option<Box<Mutator<StatepointVM>>>> =
         const { std::cell::RefCell::new(None) };
@@ -77,8 +76,6 @@ pub struct StatepointState {
     pub code_base: usize,
     /// Map from instruction offset to record index
     pub safepoint_map: std::collections::HashMap<u32, usize>,
-    /// Verbose mode
-    pub verbose: bool,
     /// Current stack frame info for root scanning
     pub current_frame: Option<FrameInfo>,
 }
@@ -345,38 +342,13 @@ impl Scanning<StatepointVM> for StatepointScanning {
             &*(header_addr.to_ptr::<HeapObjectHeader>())
         };
 
-        match header.obj_type {
-            HeapObjectType::Cons => {
-                // Cons cell has car and cdr fields
-                let obj_addr = object.to_raw_address();
-                let car_slot = TaggedSlot::new(obj_addr);
-                let cdr_slot = TaggedSlot::new(obj_addr + 8usize);
-                slot_visitor.visit_slot(car_slot);
-                slot_visitor.visit_slot(cdr_slot);
-            }
-            HeapObjectType::Vector => {
-                // Vector: first 8 bytes is length, then elements
-                let obj_addr = object.to_raw_address();
-                let len = unsafe { *(obj_addr.to_ptr::<u64>()) } as usize;
-                for i in 0..len {
-                    let slot = TaggedSlot::new(obj_addr + (8 + i * 8));
-                    slot_visitor.visit_slot(slot);
-                }
-            }
-            HeapObjectType::Closure => {
-                // Closure: code ptr + captured vars
-                // Skip first 8 bytes (code pointer)
-                let obj_addr = object.to_raw_address();
-                let num_captured = header.ptr_count as usize;
-                for i in 0..num_captured {
-                    let slot = TaggedSlot::new(obj_addr + (8 + i * 8));
-                    slot_visitor.visit_slot(slot);
-                }
-            }
-            _ => {
-                // String, ByteArray, Symbol - no pointers to scan
-            }
-        }
+        // Only Cons cells are currently supported
+        let HeapObjectType::Cons = header.obj_type;
+        let obj_addr = object.to_raw_address();
+        let car_slot = TaggedSlot::new(obj_addr);
+        let cdr_slot = TaggedSlot::new(obj_addr + 8usize);
+        slot_visitor.visit_slot(car_slot);
+        slot_visitor.visit_slot(cdr_slot);
     }
 
     fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {
@@ -607,7 +579,6 @@ pub fn init_mmtk() {
         stackmap: None,
         code_base: 0,
         safepoint_map: std::collections::HashMap::new(),
-        verbose: false,
         current_frame: None,
     });
 }
@@ -648,14 +619,6 @@ pub fn load_stackmaps(stackmap: StackMap, code_base: usize) {
         }
         s.stackmap = Some(stackmap);
         s.code_base = code_base;
-    }
-}
-
-/// Set verbose mode
-pub fn set_verbose(verbose: bool) {
-    let mut state = STATEPOINT_STATE.lock().unwrap();
-    if let Some(ref mut s) = *state {
-        s.verbose = verbose;
     }
 }
 
@@ -884,14 +847,6 @@ pub struct RuntimeSymbols {
     pub print_list: usize,
 }
 
-/// Get runtime function pointers
-pub fn get_runtime_symbols() -> (usize, usize) {
-    (
-        rt_cons_raw_mmtk as *const () as usize,
-        rt_gc_mmtk as *const () as usize,
-    )
-}
-
 /// Get all runtime symbols
 pub fn get_all_runtime_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
@@ -902,12 +857,4 @@ pub fn get_all_runtime_symbols() -> RuntimeSymbols {
         print: rt_print as *const () as usize,
         print_list: rt_print_list as *const () as usize,
     }
-}
-
-/// Get allocator mapping for fast-path allocation
-pub fn get_allocator_mapping() -> AllocatorSelector {
-    mmtk::memory_manager::get_allocator_mapping(
-        mmtk(),
-        AllocationSemantics::Default,
-    )
 }
