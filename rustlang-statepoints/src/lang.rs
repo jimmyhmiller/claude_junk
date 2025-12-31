@@ -10,7 +10,7 @@
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::values::{FunctionValue, IntValue, PointerValue, BasicValue};
+use inkwell::values::{FunctionValue, IntValue, PointerValue};
 use inkwell::types::PointerType;
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;

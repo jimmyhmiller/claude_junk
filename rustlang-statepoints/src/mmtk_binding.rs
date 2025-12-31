@@ -311,7 +311,7 @@ impl Scanning<StatepointVM> for StatepointScanning {
                             let mut slots = Vec::new();
                             for (_base_loc, derived_loc) in gc_locs.iter() {
                                 if let Some(addr) =
-                                    resolve_location(&derived_loc, frame.fp, frame.sp)
+                                    resolve_location(derived_loc, frame.fp, frame.sp)
                                 {
                                     slots.push(TaggedSlot::new(addr));
                                 }
