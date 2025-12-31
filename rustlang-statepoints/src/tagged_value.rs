@@ -163,6 +163,25 @@ pub const fn is_nil(v: TaggedValue) -> bool {
     v == NIL
 }
 
+/// Check if a value is true
+#[inline]
+pub const fn is_true(v: TaggedValue) -> bool {
+    v == TRUE
+}
+
+/// Check if a value is false
+#[inline]
+pub const fn is_false(v: TaggedValue) -> bool {
+    v == FALSE
+}
+
+/// Check if a value is a pointer (heap object)
+#[inline]
+pub const fn is_pointer(v: TaggedValue) -> bool {
+    // Heap pointers have tag bits = 0 (8-byte aligned)
+    (v & tags::TAG_MASK) == 0 && v != 0
+}
+
 /// Check if a value is truthy (everything except nil and false)
 #[inline]
 pub const fn is_truthy(v: TaggedValue) -> bool {
