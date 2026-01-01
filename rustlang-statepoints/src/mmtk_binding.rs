@@ -8,9 +8,12 @@
 
 use std::sync::{Mutex, OnceLock, Condvar};
 use std::thread::JoinHandle;
+use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mmtk::util::copy::{CopySemantics, GCWorkerCopyContext};
 use mmtk::util::{Address, ObjectReference};
+use mmtk::util::heap::vm_layout::vm_layout;
 use mmtk::util::opaque_pointer::*;
 use mmtk::vm::*;
 use mmtk::vm::slot::Slot;
@@ -19,7 +22,32 @@ use mmtk::scheduler::GCWorker;
 use mmtk::AllocationSemantics;
 
 use crate::tagged_value::*;
-use crate::stackmap::{StackMap, Location, LocationType};
+use crate::stackmap::{StackMap, StackMapFunction, Location, LocationType};
+
+fn gc_log_enabled() -> bool {
+    static GC_LOG: OnceLock<bool> = OnceLock::new();
+    *GC_LOG.get_or_init(|| std::env::var("GC_TRACE").is_ok())
+}
+
+fn root_trace_enabled() -> bool {
+    static ROOT_LOG: OnceLock<bool> = OnceLock::new();
+    *ROOT_LOG.get_or_init(|| std::env::var("STATEPOINT_ROOT_TRACE").is_ok())
+}
+
+fn gc_timing_enabled() -> bool {
+    static GC_TIMING: OnceLock<bool> = OnceLock::new();
+    *GC_TIMING.get_or_init(|| std::env::var("GC_TIMING").is_ok())
+}
+
+static GC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+macro_rules! gc_log {
+    ($($t:tt)*) => {
+        if gc_log_enabled() {
+            eprintln!($($t)*);
+        }
+    };
+}
 
 /// Thread-local data for GC worker threads
 struct WorkerThreadData {
@@ -72,12 +100,16 @@ thread_local! {
 pub struct StatepointState {
     /// Parsed stackmaps
     pub stackmap: Option<StackMap>,
-    /// Base address of JIT code
+    /// Base address of JIT code (unused when using absolute addresses)
     pub code_base: usize,
-    /// Map from instruction offset to record index
-    pub safepoint_map: std::collections::HashMap<u32, usize>,
+    /// Map from absolute return address to record index
+    pub safepoint_map: std::collections::HashMap<u64, usize>,
     /// Current stack frame info for root scanning
     pub current_frame: Option<FrameInfo>,
+    /// Saved register context for the current safepoint (AArch64)
+    pub current_regs: Option<usize>,
+    pub stack_low: usize,
+    pub stack_high: usize,
 }
 
 #[derive(Clone)]
@@ -93,6 +125,7 @@ unsafe impl Send for FrameInfo {}
 unsafe impl Sync for FrameInfo {}
 
 static STATEPOINT_STATE: Mutex<Option<StatepointState>> = Mutex::new(None);
+static mut GLOBAL_ROOT: TaggedValue = 0;
 
 /// Get the statepoint state
 pub fn statepoint_state() -> std::sync::MutexGuard<'static, Option<StatepointState>> {
@@ -173,7 +206,8 @@ impl ObjectModel<StatepointVM> for StatepointObjectModel {
         let result = ObjectReference::from_raw_address(result_addr)
             .expect("Invalid address from alloc_copy");
 
-        println!("  GC COPY {:#x} -> {:#x}", from.to_raw_address().as_usize(), result.to_raw_address().as_usize());
+        // Debug output disabled for performance:
+        // println!("  GC COPY {:#x} -> {:#x}", from.to_raw_address().as_usize(), result.to_raw_address().as_usize());
 
         copy_context.post_copy(result, bytes, semantics);
         result
@@ -204,7 +238,7 @@ impl ObjectModel<StatepointVM> for StatepointObjectModel {
     }
 
     fn get_reference_when_copied_to(_from: ObjectReference, to: Address) -> ObjectReference {
-        ObjectReference::from_raw_address(to)
+        ObjectReference::from_raw_address(to + HEAP_HEADER_SIZE)
             .expect("Invalid address in get_reference_when_copied_to")
     }
 
@@ -256,13 +290,15 @@ impl Slot for TaggedSlot {
         // Check if this is a heap pointer (tag 000 and non-null)
         if is_heap_ptr(tagged_val) {
             let ptr = tagged_val as usize;
-            // Verify it looks like a valid heap pointer
-            if ptr > 0x1000 && ptr & 0x7 == 0 {
-                let addr = unsafe { Address::from_usize(ptr) };
-                Some(unsafe { ObjectReference::from_raw_address_unchecked(addr) })
-            } else {
-                None
+            if ptr & 0x7 != 0 {
+                return None;
             }
+            let addr = unsafe { Address::from_usize(ptr) };
+            if !is_valid_object_ref(addr) {
+                return None;
+            }
+            let obj = unsafe { ObjectReference::from_raw_address_unchecked(addr) };
+            Some(obj)
         } else {
             None
         }
@@ -271,7 +307,7 @@ impl Slot for TaggedSlot {
     fn store(&self, object: ObjectReference) {
         let old_val = unsafe { *(self.addr.to_ptr::<TaggedValue>()) };
         let ptr = object.to_raw_address().as_usize() as TaggedValue;
-        println!("  ROOT UPDATE: slot at {:p} changed {:#x} -> {:#x}", self.addr.to_ptr::<u8>(), old_val, ptr);
+        let _ = old_val;
         // ptr should already have tag 000 since heap pointers are 8-byte aligned
         unsafe {
             *(self.addr.to_mut_ptr::<TaggedValue>()) = ptr;
@@ -285,51 +321,420 @@ impl Slot for TaggedSlot {
 
 pub struct StatepointScanning;
 
+#[derive(Clone, Copy)]
+struct FrameLayout {
+    stack_size: usize,
+    fp_offset: usize,
+    lr_offset: usize,
+}
+
+fn frame_layout_from_stack_size(stack_size: usize) -> Option<FrameLayout> {
+    // AArch64 keeps FP/LR in the top 16 bytes of the frame (sp + stack_size - 16/8).
+    // We assume 16-byte alignment and a canonical frame-pointer prologue.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = stack_size;
+        return None;
+    }
+    if stack_size < 16 || stack_size % 16 != 0 {
+        return None;
+    }
+    Some(FrameLayout {
+        stack_size,
+        fp_offset: stack_size - 16,
+        lr_offset: stack_size - 8,
+    })
+}
+
+fn frame_layout_for_function(func: &StackMapFunction) -> Option<FrameLayout> {
+    if let Some(layout) = decode_frame_layout_from_prologue(func.address) {
+        return Some(layout);
+    }
+    if func.stack_size == u64::MAX {
+        return None;
+    }
+    frame_layout_from_stack_size(func.stack_size as usize)
+}
+
+fn decode_frame_layout_from_prologue(func_addr: u64) -> Option<FrameLayout> {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = func_addr;
+        return None;
+    }
+
+    // Pattern A (main): stp x29, x30, [sp, #-16]!; mov x29, sp; sub sp, sp, #imm
+    // Stack grows by (imm + 16). FP/LR live at SP + imm / SP + imm + 8.
+    let inst0 = unsafe { *(func_addr as *const u32) };
+    let inst1 = unsafe { *((func_addr as *const u32).add(1)) };
+    let inst2 = unsafe { *((func_addr as *const u32).add(2)) };
+    if inst0 == 0xA9BF_7BFD && inst1 == 0x9100_03FD && (inst2 & 0xFFC0_03FF) == 0xD100_03FF {
+        let imm12 = (inst2 >> 10) & 0xFFF;
+        let size = imm12 as usize;
+        if size == 0 {
+            return None;
+        }
+        return Some(FrameLayout {
+            stack_size: size + 16,
+            fp_offset: size,
+            lr_offset: size + 8,
+        });
+    }
+
+    // Pattern B (common): sub sp, sp, #imm; stp x29, x30, [sp, #imm-16]; add x29, sp, #imm-16
+    if (inst0 & 0xFFC0_03FF) == 0xD100_03FF {
+        let imm12 = (inst0 >> 10) & 0xFFF;
+        let size = imm12 as usize;
+        if size >= 16 && size % 16 == 0 && inst2 == (0x9100_03FD | (((size - 16) as u32) << 10)) {
+            let imm7 = (size - 16) / 8;
+            let expected_stp = 0xA900_7BFD | ((imm7 as u32) << 15);
+            if inst1 == expected_stp {
+                return Some(FrameLayout {
+                    stack_size: size,
+                    fp_offset: size - 16,
+                    lr_offset: size - 8,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn function_for_pc<'a>(stackmap: &'a StackMap, pc: u64) -> Option<&'a StackMapFunction> {
+    stackmap
+        .functions
+        .iter()
+        .filter(|func| pc >= func.address)
+        .max_by_key(|func| func.address)
+}
+
+fn lookup_safepoint_record(
+    safepoint_map: &std::collections::HashMap<u64, usize>,
+    ra: u64,
+) -> Option<usize> {
+    const DELTAS: [u64; 4] = [0, 4, 8, 12];
+    for delta in DELTAS {
+        if ra >= delta {
+            if let Some(&idx) = safepoint_map.get(&(ra - delta)) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn is_probable_heap_ptr(val: u64) -> bool {
+    if val == 0 || val & 7 != 0 {
+        return false;
+    }
+    let addr = unsafe { Address::from_usize(val as usize) };
+    is_valid_object_ref(addr)
+}
+
+fn conservative_scan_frame(
+    slots: &mut Vec<TaggedSlot>,
+    frame_start: usize,
+    frame_end: usize,
+) -> usize {
+    let mut added = 0usize;
+    let mut addr = frame_start;
+    while addr + 8 <= frame_end {
+        let val = unsafe { std::ptr::read_unaligned(addr as *const u64) };
+        if is_probable_heap_ptr(val) {
+            let slot_addr = unsafe { Address::from_usize(addr) };
+            slots.push(TaggedSlot::new(slot_addr));
+            added += 1;
+        }
+        addr += 8;
+    }
+    added
+}
+
+fn is_valid_object_ref(addr: Address) -> bool {
+    if addr.as_usize() < HEAP_HEADER_SIZE {
+        return false;
+    }
+    let layout = vm_layout();
+    if addr < layout.heap_start || addr >= layout.heap_end {
+        return false;
+    }
+    if !addr.is_mapped() {
+        return false;
+    }
+    let header_addr = addr - HEAP_HEADER_SIZE;
+    if !header_addr.is_mapped() {
+        return false;
+    }
+    let header = unsafe { &*(header_addr.to_ptr::<HeapObjectHeader>()) };
+    header.magic == HEAP_MAGIC && header.size > 0
+}
+
 impl Scanning<StatepointVM> for StatepointScanning {
     fn scan_roots_in_mutator_thread(
         _tls: VMWorkerThread,
         _mutator: &'static mut Mutator<StatepointVM>,
         mut factory: impl RootsWorkFactory<TaggedSlot>,
     ) {
-        // Get the current frame info from statepoint state
+        gc_log!("GC: scan_roots_in_mutator_thread called");
+
         let state = statepoint_state();
-        if let Some(ref state) = *state {
-            if let Some(ref frame) = state.current_frame {
-                // Find the safepoint record for this return address
-                if state.code_base > 0 && frame.return_addr >= state.code_base {
-                    let offset = (frame.return_addr - state.code_base) as u32;
+        if state.is_none() {
+            gc_log!("GC: no statepoint state!");
+            return;
+        }
+        let state_ref = state.as_ref().unwrap();
 
-                    // Look for safepoint
-                    if let Some(&record_idx) = state.safepoint_map.get(&offset) {
-                        if let Some(ref stackmap) = state.stackmap {
-                            let record = &stackmap.records[record_idx];
-                            let gc_locs = stackmap.get_gc_locations(record);
+        let mut slots = Vec::new();
+        if unsafe { GLOBAL_ROOT } != 0 {
+            if root_trace_enabled() {
+                let val = unsafe { GLOBAL_ROOT };
+                let addr = unsafe { Address::from_mut_ptr(&raw mut GLOBAL_ROOT as *mut TaggedValue) };
+                let is_heap = is_heap_ptr(val);
+                let is_valid = if is_heap {
+                    is_valid_object_ref(unsafe { Address::from_usize(val as usize) })
+                } else {
+                    false
+                };
+                eprintln!(
+                    "GC ROOT: slot={:#x} val={:#x} heap={} valid={}",
+                    addr.as_usize(),
+                    val,
+                    is_heap,
+                    is_valid
+                );
+            }
+            let addr = unsafe { Address::from_mut_ptr(&raw mut GLOBAL_ROOT as *mut TaggedValue) };
+            slots.push(TaggedSlot::new(addr));
+        }
 
-                            let mut slots = Vec::new();
-                            for (_base_loc, derived_loc) in gc_locs.iter() {
-                                if let Some(addr) =
-                                    resolve_location(derived_loc, frame.fp, frame.sp)
-                                {
-                                    slots.push(TaggedSlot::new(addr));
-                                }
-                            }
+        // Get the initial frame saved when entering rt_cons
+        let initial = match &state_ref.current_frame {
+            Some(f) => f.clone(),
+            None => {
+                gc_log!("GC: no current_frame!");
+                if !slots.is_empty() {
+                    factory.create_process_roots_work(slots);
+                }
+                return;
+            }
+        };
 
-                            if !slots.is_empty() {
-                                factory.create_process_roots_work(slots);
-                            }
+        let stackmap = match &state_ref.stackmap {
+            Some(stackmap) => stackmap,
+            None => {
+                gc_log!("GC: no stackmap loaded");
+                return;
+            }
+        };
+
+        let target_ra = initial.return_addr;
+        let stack_low = if state_ref.stack_low != 0 {
+            state_ref.stack_low
+        } else {
+            initial.sp as usize
+        };
+        let stack_high = if state_ref.stack_high != 0 {
+            state_ref.stack_high
+        } else {
+            stack_low + 0x800000
+        };
+        let mut current_ra = target_ra;
+        let mut current_fp = 0usize;
+        let mut current_sp = initial.sp as usize;
+        let mut frame_depth = 1usize;
+        let mut tail_scan_start: Option<usize> = None;
+
+        loop {
+            let func = match function_for_pc(stackmap, current_ra as u64) {
+                Some(func) => func,
+                None => {
+                    gc_log!("GC: no function found for ra={:#x}", current_ra);
+                    tail_scan_start = Some(current_sp);
+                    break;
+                }
+            };
+            let layout = match frame_layout_for_function(func) {
+                Some(layout) => layout,
+                None => {
+                    gc_log!(
+                        "GC: unsupported stack_size={} for ra={:#x}",
+                        func.stack_size, current_ra
+                    );
+                    tail_scan_start = Some(current_sp);
+                    break;
+                }
+            };
+            if current_fp == 0 {
+                current_fp = current_sp + layout.fp_offset;
+            }
+            if current_sp == 0 {
+                if current_fp < layout.fp_offset {
+                    break;
+                }
+                current_sp = current_fp - layout.fp_offset;
+            }
+            if current_sp < stack_low || current_sp > stack_high {
+                tail_scan_start = Some(current_sp);
+                break;
+            }
+            if current_fp < stack_low || current_fp > stack_high {
+                tail_scan_start = Some(current_sp);
+                break;
+            }
+            let mut precise_roots = 0usize;
+            if let Some(record_idx) =
+                lookup_safepoint_record(&state_ref.safepoint_map, current_ra as u64)
+            {
+                let record = &stackmap.records[record_idx];
+                let gc_locs = stackmap.get_gc_locations(record);
+
+                gc_log!(
+                    "  record_idx={} has {} locs, {} GC locs, fp={:#x} sp={:#x}",
+                    record_idx,
+                    record.locations.len(),
+                    gc_locs.len(),
+                    current_fp,
+                    current_sp
+                );
+
+                let regs_for_frame = if frame_depth == 1 {
+                    state_ref.current_regs
+                } else {
+                    None
+                };
+                for (i, (base_loc, derived_loc)) in gc_locs.iter().enumerate() {
+                    gc_log!("    loc[{}]: reg={} offset={}", i, derived_loc.reg, derived_loc.offset);
+                    let mut addr = resolve_location(
+                        derived_loc,
+                        current_fp as *const u8,
+                        current_sp as *const u8,
+                        regs_for_frame,
+                        stack_low,
+                        stack_high,
+                    );
+                    if addr.is_none() {
+                        addr = resolve_location(
+                            base_loc,
+                            current_fp as *const u8,
+                            current_sp as *const u8,
+                            regs_for_frame,
+                            stack_low,
+                            stack_high,
+                        );
+                    }
+                    if let Some(addr) = addr {
+                        if addr.as_usize() & 7 != 0 {
+                            continue;
+                        }
+                        let val = unsafe { std::ptr::read_unaligned(addr.to_ptr::<u64>()) };
+                        gc_log!("    -> slot at {:?} = {:#x}", addr, val);
+
+                        if is_heap_ptr(val as TaggedValue) {
+                            gc_log!("      -> ADDED as root!");
+                            slots.push(TaggedSlot::new(addr));
+                            precise_roots += 1;
                         }
                     }
                 }
             }
+            if precise_roots == 0 && std::env::var("STATEPOINT_DISABLE_CONSERVATIVE").is_err() {
+                let frame_end = (current_sp + layout.stack_size).min(stack_high);
+                conservative_scan_frame(&mut slots, current_sp, frame_end);
+            }
+
+            frame_depth += 1;
+            if frame_depth > 100 {
+                gc_log!("GC: Frame chain too deep, stopping");
+                break;
+            }
+
+            let lr_slot = match current_sp.checked_add(layout.lr_offset) {
+                Some(val) => val,
+                None => break,
+            };
+            if lr_slot + 8 > stack_high {
+                gc_log!(
+                    "GC: Frame chain ended at depth {} (LR slot out of bounds)",
+                    frame_depth
+                );
+                tail_scan_start = Some(current_sp);
+                break;
+            }
+
+            let caller_ra = unsafe { std::ptr::read_unaligned(lr_slot as *const usize) } as u64;
+            if function_for_pc(stackmap, caller_ra).is_none() {
+                gc_log!(
+                    "GC: Frame chain ended at depth {} (caller ra not in JIT functions)",
+                    frame_depth
+                );
+                tail_scan_start = Some(current_sp);
+                break;
+            }
+
+            let caller_sp = match current_sp.checked_add(layout.stack_size) {
+                Some(val) => val,
+                None => break,
+            };
+            if caller_sp < stack_low || caller_sp > stack_high {
+                gc_log!(
+                    "GC: Frame chain ended at depth {} (caller sp out of bounds)",
+                    frame_depth
+                );
+                tail_scan_start = Some(current_sp);
+                break;
+            }
+
+            current_sp = caller_sp;
+            current_fp = 0;
+            current_ra = caller_ra as usize;
+
+            // Safety limit
+            // (handled above)
+        }
+
+        if std::env::var("STATEPOINT_DISABLE_CONSERVATIVE").is_err() {
+            if frame_depth <= 1 {
+                conservative_scan_frame(&mut slots, initial.sp as usize, stack_high);
+            } else if let Some(start) = tail_scan_start {
+                let scan_start = start.max(stack_low);
+                if scan_start < stack_high {
+                    conservative_scan_frame(&mut slots, scan_start, stack_high);
+                }
+            }
+        }
+        gc_log!("GC: total roots found: {}", slots.len());
+        if !slots.is_empty() {
+            factory.create_process_roots_work(slots);
         }
         drop(state);
     }
 
     fn scan_vm_specific_roots(
         _tls: VMWorkerThread,
-        _factory: impl RootsWorkFactory<TaggedSlot>,
+        mut _factory: impl RootsWorkFactory<TaggedSlot>,
     ) {
-        // We could add global roots here if needed
+        if unsafe { GLOBAL_ROOT } != 0 {
+            let addr = unsafe { Address::from_mut_ptr(&raw mut GLOBAL_ROOT as *mut TaggedValue) };
+            gc_log!("GC: scanning global root slot at {:#x}", addr.as_usize());
+            if root_trace_enabled() {
+                let val = unsafe { GLOBAL_ROOT };
+                let is_heap = is_heap_ptr(val);
+                let is_valid = if is_heap {
+                    is_valid_object_ref(unsafe { Address::from_usize(val as usize) })
+                } else {
+                    false
+                };
+                eprintln!(
+                    "GC ROOT (vm): slot={:#x} val={:#x} heap={} valid={}",
+                    addr.as_usize(),
+                    val,
+                    is_heap,
+                    is_valid
+                );
+            }
+            _factory.create_process_roots_work(vec![TaggedSlot::new(addr)]);
+        }
     }
 
     fn scan_object<SV: SlotVisitor<TaggedSlot>>(
@@ -365,26 +770,109 @@ impl Scanning<StatepointVM> for StatepointScanning {
 }
 
 /// Resolve a stackmap location to a memory address
-fn resolve_location(loc: &Location, fp: *const u8, sp: *const u8) -> Option<Address> {
-    match loc.ty {
-        LocationType::Indirect | LocationType::Direct => {
-            #[cfg(target_arch = "aarch64")]
-            let base = match loc.reg {
-                29 => fp, // x29 = FP
-                31 => sp, // SP
-                _ => sp,  // Fallback to SP
-            };
-            #[cfg(target_arch = "x86_64")]
-            let base = match loc.reg {
-                6 => fp, // RBP
-                7 => sp, // RSP
-                _ => sp,
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let base = sp;
+fn resolve_location(
+    loc: &Location,
+    fp: *const u8,
+    sp: *const u8,
+    regs: Option<usize>,
+    stack_low: usize,
+    stack_high: usize,
+) -> Option<Address> {
+    if loc.ty == LocationType::Register {
+        let regs = regs? as *mut usize;
+        if loc.offset != 0 {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let idx = loc.reg as usize;
+            if idx > 31 {
+                return None;
+            }
+            let slot = unsafe { regs.add(idx) };
+            return Some(Address::from_ptr(slot as *const u8));
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            return None;
+        }
+    }
 
-            let addr = unsafe { base.offset(loc.offset as isize) };
-            Some(Address::from_ptr(addr))
+    #[cfg(target_arch = "aarch64")]
+    let (base, base_from_regs) = match loc.reg {
+        29 => {
+            if let Some(regs) = regs {
+                let regs = regs as *const usize;
+                (unsafe { *(regs.add(29)) as *const u8 }, true)
+            } else {
+                (fp, false)
+            }
+        }
+        31 => {
+            if let Some(regs) = regs {
+                let regs = regs as *const usize;
+                (unsafe { *(regs.add(31)) as *const u8 }, true)
+            } else {
+                (sp, false)
+            }
+        }
+        _ => {
+            if let Some(regs) = regs {
+                let regs = regs as *const usize;
+                let idx = loc.reg as usize;
+                if idx <= 30 {
+                    (unsafe { *(regs.add(idx)) as *const u8 }, true)
+                } else {
+                    (sp, false)
+                }
+            } else {
+                (sp, false)
+            }
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    let (base, base_from_regs) = match loc.reg {
+        6 => (fp, false), // RBP
+        7 => (sp, false), // RSP
+        _ => {
+            if let Some(regs) = regs {
+                let regs = regs as *const usize;
+                let idx = loc.reg as usize;
+                (unsafe { *(regs.add(idx)) as *const u8 }, true)
+            } else {
+                (sp, false)
+            }
+        }
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let (base, base_from_regs) = (sp, false);
+
+    if base_from_regs {
+        let base_usize = base as usize;
+        if base_usize < stack_low || base_usize > stack_high {
+            return None;
+        }
+    }
+
+    let base_usize = base as usize;
+    let addr_usize = if loc.offset >= 0 {
+        base_usize.checked_add(loc.offset as usize)?
+    } else {
+        base_usize.checked_sub((-loc.offset) as usize)?
+    };
+    let addr = addr_usize as *const u8;
+    if addr_usize < stack_low || addr_usize + 8 > stack_high {
+        return None;
+    }
+    match loc.ty {
+        LocationType::Direct => Some(Address::from_ptr(addr)),
+        LocationType::Indirect => {
+            let slot_addr = unsafe { std::ptr::read_unaligned(addr as *const usize) };
+            if slot_addr == 0 {
+                None
+            } else {
+                Some(unsafe { Address::from_usize(slot_addr) })
+            }
         }
         _ => None,
     }
@@ -415,6 +903,7 @@ impl Collection<StatepointVM> for StatepointCollection {
         if let Ok(mut state) = STATEPOINT_STATE.lock() {
             if let Some(ref mut s) = *state {
                 s.current_frame = None;
+                s.current_regs = None;
             }
         }
         // Signal that GC is complete
@@ -433,7 +922,7 @@ impl Collection<StatepointVM> for StatepointCollection {
             let result = cvar.wait_timeout(gc_done, timeout).unwrap();
             gc_done = result.0;
             if result.1.timed_out() {
-                eprintln!("WARNING: GC block_for_gc timed out");
+                gc_log!("WARNING: GC block_for_gc timed out");
                 return;
             }
         }
@@ -564,23 +1053,33 @@ impl ReferenceGlue<StatepointVM> for StatepointReferenceGlue {
 pub fn init_mmtk() {
     let mut builder = MMTKBuilder::new();
 
-    // Set the plan (SemiSpace is a simple copying collector)
-    builder.set_option("plan", "SemiSpace");
+    // Set the plan (default: SemiSpace)
+    let gc_plan = std::env::var("GC_PLAN").unwrap_or_else(|_| "SemiSpace".to_string());
+    builder.set_option("plan", &gc_plan);
 
-    // Set heap size - 64MB should be plenty for demos
-    builder.options.gc_trigger.set(mmtk::util::options::GCTriggerSelector::FixedHeapSize(64 * 1024 * 1024));
+    // Set heap size - small heap to force GC
+    let heap_mb = std::env::var("GC_HEAP_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16);
+    builder.options.gc_trigger.set(
+        mmtk::util::options::GCTriggerSelector::FixedHeapSize(heap_mb * 1024 * 1024),
+    );
 
     let mmtk_instance = builder.build();
     MMTK_INSTANCE.set(Box::new(mmtk_instance)).ok();
 
     // Initialize statepoint state
     let mut state = STATEPOINT_STATE.lock().unwrap();
-    *state = Some(StatepointState {
-        stackmap: None,
-        code_base: 0,
-        safepoint_map: std::collections::HashMap::new(),
-        current_frame: None,
-    });
+        *state = Some(StatepointState {
+            stackmap: None,
+            code_base: 0,
+            safepoint_map: std::collections::HashMap::new(),
+            current_frame: None,
+            current_regs: None,
+            stack_low: 0,
+            stack_high: 0,
+        });
 }
 
 /// Bind the current thread as a mutator
@@ -602,6 +1101,20 @@ pub fn bind_mutator() {
             *global_ptr = Some(MutatorPtr(ptr));
         }
     });
+
+    #[cfg(target_os = "macos")]
+    {
+        let pthread = unsafe { libc::pthread_self() };
+        let stack_size = unsafe { libc::pthread_get_stacksize_np(pthread) };
+        let stack_high = unsafe { libc::pthread_get_stackaddr_np(pthread) } as usize;
+        let stack_low = stack_high.saturating_sub(stack_size);
+        if let Ok(mut state) = STATEPOINT_STATE.lock() {
+            if let Some(ref mut s) = *state {
+                s.stack_low = stack_low;
+                s.stack_high = stack_high;
+            }
+        }
+    }
 }
 
 /// Enable collection
@@ -610,15 +1123,44 @@ pub fn enable_collection() {
     mmtk::memory_manager::initialize_collection(mmtk(), tls);
 }
 
+pub fn start_gc_stats() {
+    let tls = VMMutatorThread(VMThread::UNINITIALIZED);
+    mmtk().harness_begin(tls);
+}
+
+pub fn end_gc_stats() {
+    mmtk().harness_end();
+}
+
 /// Load stackmaps from compiled code
-pub fn load_stackmaps(stackmap: StackMap, code_base: usize) {
+pub fn load_stackmaps(stackmap: StackMap, _code_base: usize) {
     let mut state = STATEPOINT_STATE.lock().unwrap();
     if let Some(ref mut s) = *state {
-        for (idx, record) in stackmap.records.iter().enumerate() {
-            s.safepoint_map.insert(record.instruction_offset, idx);
+        let mut stackmap = stackmap;
+        stackmap.functions.sort_by_key(|f| f.address);
+        // Print function info for debugging (first function is code start)
+        if let Some(first_func) = stackmap.functions.first() {
+            gc_log!("JIT code starts at {:#x}, {} functions, {} safepoints",
+                first_func.address, stackmap.functions.len(), stackmap.records.len());
         }
+
+        // Use absolute_offset (which includes function address) as the key
+        for (_idx, record) in stackmap.records.iter().enumerate() {
+            s.safepoint_map.insert(record.absolute_offset, _idx);
+        }
+
+        if std::env::var("STATEPOINT_STACK_SIZES").is_ok() {
+            let mut max_size = 0u64;
+            for func in &stackmap.functions {
+                if func.stack_size > max_size {
+                    max_size = func.stack_size;
+                }
+            }
+            eprintln!("JIT stackmap: {} functions, max stack_size={} bytes", stackmap.functions.len(), max_size);
+        }
+
+        s.code_base = _code_base;
         s.stackmap = Some(stackmap);
-        s.code_base = code_base;
     }
 }
 
@@ -682,13 +1224,6 @@ pub fn alloc_cons(car: TaggedValue, cdr: TaggedValue) -> TaggedValue {
 
 /// Trigger GC with current frame info
 pub fn trigger_gc(fp: *const u8, _sp: *const u8, return_addr: usize) {
-    // The stackmap locations are relative to the JIT caller's frame, not our frame.
-    // On arm64: JIT's SP = our FP + 16 (above saved FP/LR pair)
-    #[cfg(target_arch = "aarch64")]
-    let jit_sp = (fp as usize + 16) as *const u8;
-    #[cfg(target_arch = "x86_64")]
-    let jit_sp = (fp as usize + 16) as *const u8;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let jit_sp = _sp;
 
     // Set current frame for root scanning
@@ -705,7 +1240,19 @@ pub fn trigger_gc(fp: *const u8, _sp: *const u8, return_addr: usize) {
 
     // Trigger GC with force=true to ensure it actually runs
     let tls = VMMutatorThread(VMThread::UNINITIALIZED);
+    let (gc_id, start) = if gc_timing_enabled() {
+        let id = GC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let start = Instant::now();
+        eprintln!("GC START {}", id);
+        (Some(id), Some(start))
+    } else {
+        (None, None)
+    };
     mmtk().handle_user_collection_request(tls, true, false);
+    if let (Some(id), Some(start)) = (gc_id, start) {
+        let elapsed = start.elapsed().as_millis();
+        eprintln!("GC END {} ({} ms)", id, elapsed);
+    }
 
     // NOTE: Don't clear frame info here - it will be cleared in resume_mutators
     // after scanning is complete
@@ -716,35 +1263,118 @@ pub fn trigger_gc(fp: *const u8, _sp: *const u8, return_addr: usize) {
 // ============================================================================
 
 /// Runtime: Allocate a cons cell (returns raw pointer for LLVM)
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
-pub extern "C" fn rt_cons_raw_mmtk(car: TaggedValue, cdr: TaggedValue) -> *mut u8 {
+#[unsafe(naked)]
+pub unsafe extern "C" fn rt_cons_raw_mmtk(_car: TaggedValue, _cdr: TaggedValue) -> *mut u8 {
+    core::arch::naked_asm!(
+        "sub sp, sp, #256",
+        "stp x0, x1, [sp, #0]",
+        "stp x2, x3, [sp, #16]",
+        "stp x4, x5, [sp, #32]",
+        "stp x6, x7, [sp, #48]",
+        "stp x8, x9, [sp, #64]",
+        "stp x10, x11, [sp, #80]",
+        "stp x12, x13, [sp, #96]",
+        "stp x14, x15, [sp, #112]",
+        "stp x16, x17, [sp, #128]",
+        "stp x18, x19, [sp, #144]",
+        "stp x20, x21, [sp, #160]",
+        "stp x22, x23, [sp, #176]",
+        "stp x24, x25, [sp, #192]",
+        "stp x26, x27, [sp, #208]",
+        "stp x28, x29, [sp, #224]",
+        "str x30, [sp, #240]",
+        "add x15, sp, #256",
+        "str x15, [sp, #248]",
+        "mov x2, x29",
+        "mov x3, x15",
+        "mov x4, x30",
+        "mov x5, sp",
+        "bl {impl_fn}",
+        "ldr x1, [sp, #8]",
+        "ldr x2, [sp, #16]",
+        "ldr x3, [sp, #24]",
+        "ldr x4, [sp, #32]",
+        "ldr x5, [sp, #40]",
+        "ldr x6, [sp, #48]",
+        "ldr x7, [sp, #56]",
+        "ldr x8, [sp, #64]",
+        "ldr x9, [sp, #72]",
+        "ldr x10, [sp, #80]",
+        "ldr x11, [sp, #88]",
+        "ldr x12, [sp, #96]",
+        "ldr x13, [sp, #104]",
+        "ldr x14, [sp, #112]",
+        "ldr x15, [sp, #120]",
+        "ldr x16, [sp, #128]",
+        "ldr x17, [sp, #136]",
+        "ldr x18, [sp, #144]",
+        "ldr x19, [sp, #152]",
+        "ldr x20, [sp, #160]",
+        "ldr x21, [sp, #168]",
+        "ldr x22, [sp, #176]",
+        "ldr x23, [sp, #184]",
+        "ldr x24, [sp, #192]",
+        "ldr x25, [sp, #200]",
+        "ldr x26, [sp, #208]",
+        "ldr x27, [sp, #216]",
+        "ldr x28, [sp, #224]",
+        "ldr x29, [sp, #232]",
+        "ldr x30, [sp, #240]",
+        "ldr x15, [sp, #248]",
+        "mov sp, x15",
+        "ret",
+        impl_fn = sym rt_cons_raw_mmtk_impl,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn rt_cons_raw_mmtk_impl(
+    car: TaggedValue,
+    cdr: TaggedValue,
+    fp: *const u8,
+    sp: *const u8,
+    ra: usize,
+    regs: *mut usize,
+) -> *mut u8 {
+    static ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 5 {
+        gc_log!("ALLOC #{}: cons({:#x}, {:#x})", count, car, cdr);
+        if count < 3 {
+            let saved_fp = unsafe { std::ptr::read_unaligned(fp as *const usize) };
+            let saved_ra_at_saved_fp =
+                unsafe { std::ptr::read_unaligned((saved_fp + 8) as *const usize) };
+            gc_log!("rt_cons frame: fp={:#x} sp={:#x} ra={:#x}", fp as usize, sp as usize, ra);
+            gc_log!("  saved_fp={:#x} (gap={} bytes)", saved_fp, saved_fp.saturating_sub(fp as usize));
+            gc_log!("  [saved_fp+8]={:#x} (is this JIT addr?)", saved_ra_at_saved_fp);
+        }
+    }
+
+    {
+        let mut state = STATEPOINT_STATE.lock().unwrap();
+        if let Some(ref mut s) = *state {
+            s.current_frame = Some(FrameInfo { fp, sp, return_addr: ra });
+            s.current_regs = Some(regs as usize);
+        }
+    }
+
     let result = alloc_cons(car, cdr);
-    println!("  ALLOC cons at {:#x} (car={}, cdr={:#x})", result, car >> 1, cdr);
+
     result as *mut u8
 }
 
-/// Runtime: Trigger GC
+#[cfg(not(target_arch = "aarch64"))]
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn rt_gc_mmtk() {
-    // Get current frame pointer
-    #[cfg(target_arch = "aarch64")]
-    let (fp, sp, ra) = unsafe {
-        let fp: usize;
-        let sp: usize;
-        let ra: usize;
-        std::arch::asm!(
-            "mov {fp}, x29",
-            "mov {sp}, sp",
-            "mov {ra}, x30",
-            fp = out(reg) fp,
-            sp = out(reg) sp,
-            ra = out(reg) ra,
-            options(nomem, nostack)
-        );
-        (fp as *const u8, sp as *const u8, ra)
-    };
-
+pub extern "C" fn rt_cons_raw_mmtk(car: TaggedValue, cdr: TaggedValue) -> *mut u8 {
+    static ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 5 {
+        gc_log!("ALLOC #{}: cons({:#x}, {:#x})", count, car, cdr);
+    }
     #[cfg(target_arch = "x86_64")]
     let (fp, sp, ra) = unsafe {
         let fp: usize;
@@ -756,12 +1386,124 @@ pub extern "C" fn rt_gc_mmtk() {
             sp = out(reg) sp,
             options(nomem, nostack)
         );
-        // Return address is at [rbp+8]
         let ra = *((fp + 8) as *const usize);
         (fp as *const u8, sp as *const u8, ra)
     };
+    #[cfg(not(target_arch = "x86_64"))]
+    let (fp, sp, ra) = (std::ptr::null(), std::ptr::null(), 0usize);
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut state = STATEPOINT_STATE.lock().unwrap();
+        if let Some(ref mut s) = *state {
+            s.current_frame = Some(FrameInfo { fp, sp, return_addr: ra });
+            s.current_regs = None;
+        }
+    }
+
+    let result = alloc_cons(car, cdr);
+
+    result as *mut u8
+}
+
+/// Runtime: Trigger GC
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+#[unsafe(naked)]
+pub unsafe extern "C" fn rt_gc_mmtk() {
+    core::arch::naked_asm!(
+        "sub sp, sp, #256",
+        "stp x0, x1, [sp, #0]",
+        "stp x2, x3, [sp, #16]",
+        "stp x4, x5, [sp, #32]",
+        "stp x6, x7, [sp, #48]",
+        "stp x8, x9, [sp, #64]",
+        "stp x10, x11, [sp, #80]",
+        "stp x12, x13, [sp, #96]",
+        "stp x14, x15, [sp, #112]",
+        "stp x16, x17, [sp, #128]",
+        "stp x18, x19, [sp, #144]",
+        "stp x20, x21, [sp, #160]",
+        "stp x22, x23, [sp, #176]",
+        "stp x24, x25, [sp, #192]",
+        "stp x26, x27, [sp, #208]",
+        "stp x28, x29, [sp, #224]",
+        "str x30, [sp, #240]",
+        "add x15, sp, #256",
+        "str x15, [sp, #248]",
+        "mov x0, x29",
+        "mov x1, x15",
+        "mov x2, x30",
+        "mov x3, sp",
+        "bl {impl_fn}",
+        "ldr x0, [sp, #0]",
+        "ldr x1, [sp, #8]",
+        "ldr x2, [sp, #16]",
+        "ldr x3, [sp, #24]",
+        "ldr x4, [sp, #32]",
+        "ldr x5, [sp, #40]",
+        "ldr x6, [sp, #48]",
+        "ldr x7, [sp, #56]",
+        "ldr x8, [sp, #64]",
+        "ldr x9, [sp, #72]",
+        "ldr x10, [sp, #80]",
+        "ldr x11, [sp, #88]",
+        "ldr x12, [sp, #96]",
+        "ldr x13, [sp, #104]",
+        "ldr x14, [sp, #112]",
+        "ldr x15, [sp, #120]",
+        "ldr x16, [sp, #128]",
+        "ldr x17, [sp, #136]",
+        "ldr x18, [sp, #144]",
+        "ldr x19, [sp, #152]",
+        "ldr x20, [sp, #160]",
+        "ldr x21, [sp, #168]",
+        "ldr x22, [sp, #176]",
+        "ldr x23, [sp, #184]",
+        "ldr x24, [sp, #192]",
+        "ldr x25, [sp, #200]",
+        "ldr x26, [sp, #208]",
+        "ldr x27, [sp, #216]",
+        "ldr x28, [sp, #224]",
+        "ldr x29, [sp, #232]",
+        "ldr x30, [sp, #240]",
+        "ldr x15, [sp, #248]",
+        "mov sp, x15",
+        "ret",
+        impl_fn = sym rt_gc_mmtk_impl,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn rt_gc_mmtk_impl(fp: *const u8, sp: *const u8, ra: usize, regs: *mut usize) {
+    {
+        let mut state = STATEPOINT_STATE.lock().unwrap();
+        if let Some(ref mut s) = *state {
+            s.current_regs = Some(regs as usize);
+        }
+    }
+    trigger_gc(fp, sp, ra);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn rt_gc_mmtk() {
+    #[cfg(target_arch = "x86_64")]
+    let (fp, sp, ra) = unsafe {
+        let fp: usize;
+        let sp: usize;
+        std::arch::asm!(
+            "mov {fp}, rbp",
+            "mov {sp}, rsp",
+            fp = out(reg) fp,
+            sp = out(reg) sp,
+            options(nomem, nostack)
+        );
+        let ra = *((fp + 8) as *const usize);
+        (fp as *const u8, sp as *const u8, ra)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
     let (fp, sp, ra) = (std::ptr::null(), std::ptr::null(), 0usize);
 
     trigger_gc(fp, sp, ra);
@@ -770,6 +1512,10 @@ pub extern "C" fn rt_gc_mmtk() {
 /// Runtime car - extract first element of cons cell
 #[no_mangle]
 pub extern "C" fn rt_car(cell: TaggedValue) -> TaggedValue {
+    if !crate::tagged_value::is_pointer(cell) {
+        gc_log!("rt_car: non-pointer value {:#x}", cell);
+        return crate::tagged_value::NIL;
+    }
     let ptr = cell as usize as *const ConsCell;
     unsafe { (*ptr).car }
 }
@@ -777,8 +1523,29 @@ pub extern "C" fn rt_car(cell: TaggedValue) -> TaggedValue {
 /// Runtime cdr - extract rest of cons cell
 #[no_mangle]
 pub extern "C" fn rt_cdr(cell: TaggedValue) -> TaggedValue {
+    if !crate::tagged_value::is_pointer(cell) {
+        gc_log!("rt_cdr: non-pointer value {:#x}", cell);
+        return crate::tagged_value::NIL;
+    }
     let ptr = cell as usize as *const ConsCell;
     unsafe { (*ptr).cdr }
+}
+
+/// Runtime root management - keep a single global root alive
+#[no_mangle]
+pub extern "C" fn rt_set_global_root(val: TaggedValue) {
+    unsafe {
+        GLOBAL_ROOT = val;
+    }
+    gc_log!("GC: set global root to {:#x}", val);
+}
+
+#[no_mangle]
+pub extern "C" fn rt_clear_global_root() {
+    unsafe {
+        GLOBAL_ROOT = 0;
+    }
+    gc_log!("GC: cleared global root");
 }
 
 /// Runtime print - print a tagged value
@@ -837,14 +1604,65 @@ pub extern "C" fn rt_print_list(mut val: TaggedValue) {
     println!(")");
 }
 
+/// Runtime: print "stretch tree of depth X\t check: Y"
+#[no_mangle]
+pub extern "C" fn rt_print_stretch_check(depth: TaggedValue, check: TaggedValue) {
+    use crate::tagged_value::fixnum_value;
+    println!("stretch tree of depth {}\t check: {}", fixnum_value(depth), fixnum_value(check));
+}
+
+/// Runtime: print "N\t trees of depth X\t check: Y"
+#[no_mangle]
+pub extern "C" fn rt_print_trees_check(iters: TaggedValue, depth: TaggedValue, check: TaggedValue) {
+    use crate::tagged_value::fixnum_value;
+    println!("{}\t trees of depth {}\t check: {}", fixnum_value(iters), fixnum_value(depth), fixnum_value(check));
+}
+
+/// Runtime: print "long lived tree of depth X\t check: Y"
+#[no_mangle]
+pub extern "C" fn rt_print_long_lived_check(depth: TaggedValue, check: TaggedValue) {
+    use crate::tagged_value::fixnum_value;
+    println!("long lived tree of depth {}\t check: {}", fixnum_value(depth), fixnum_value(check));
+}
+
+/// Runtime: get command line argument (returns tagged fixnum, or 0 if not present)
+#[no_mangle]
+pub extern "C" fn rt_get_arg(idx: TaggedValue) -> TaggedValue {
+    use crate::tagged_value::{fixnum_value, make_fixnum};
+    let idx = fixnum_value(idx) as usize;
+    let args: Vec<String> = std::env::args().collect();
+    if idx < args.len() {
+        if let Ok(n) = args[idx].parse::<i64>() {
+            return make_fixnum(n);
+        }
+    }
+    make_fixnum(0)
+}
+
+/// Runtime: max of two fixnums
+#[no_mangle]
+pub extern "C" fn rt_max(a: TaggedValue, b: TaggedValue) -> TaggedValue {
+    use crate::tagged_value::{fixnum_value, make_fixnum};
+    let a_val = fixnum_value(a);
+    let b_val = fixnum_value(b);
+    make_fixnum(std::cmp::max(a_val, b_val))
+}
+
 /// Runtime symbols struct
 pub struct RuntimeSymbols {
     pub cons: usize,
     pub gc: usize,
     pub car: usize,
     pub cdr: usize,
+    pub set_global_root: usize,
+    pub clear_global_root: usize,
     pub print: usize,
     pub print_list: usize,
+    pub print_stretch_check: usize,
+    pub print_trees_check: usize,
+    pub print_long_lived_check: usize,
+    pub get_arg: usize,
+    pub max: usize,
 }
 
 /// Get all runtime symbols
@@ -854,7 +1672,14 @@ pub fn get_all_runtime_symbols() -> RuntimeSymbols {
         gc: rt_gc_mmtk as *const () as usize,
         car: rt_car as *const () as usize,
         cdr: rt_cdr as *const () as usize,
+        set_global_root: rt_set_global_root as *const () as usize,
+        clear_global_root: rt_clear_global_root as *const () as usize,
         print: rt_print as *const () as usize,
         print_list: rt_print_list as *const () as usize,
+        print_stretch_check: rt_print_stretch_check as *const () as usize,
+        print_trees_check: rt_print_trees_check as *const () as usize,
+        print_long_lived_check: rt_print_long_lived_check as *const () as usize,
+        get_arg: rt_get_arg as *const () as usize,
+        max: rt_max as *const () as usize,
     }
 }
