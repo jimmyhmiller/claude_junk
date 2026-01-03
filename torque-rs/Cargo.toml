@@ -1,0 +1,21 @@
+[package]
+name = "torque-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Lexer - fast and derive-based
+logos = "0.14"
+
+# Parser combinator with great errors
+chumsky = "0.9"
+
+# Span tracking
+ariadne = "0.4"    # Pretty error reporting
+
+# Utilities
+thiserror = "1.0"
+smol_str = "0.2"   # Interned strings for identifiers
+
+[dev-dependencies]
+insta = "1.34"     # Snapshot testing
