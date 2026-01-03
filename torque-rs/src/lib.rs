@@ -317,4 +317,62 @@ mod tests {
         assert!(matches!(tokens[0].token, lexer::Token::Javascript));
         assert!(matches!(tokens[1].token, lexer::Token::Builtin));
     }
+
+    #[test]
+    fn test_parse_namespace() {
+        let source = "namespace test { }";
+        let result = parse_source(source);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+        let ast = result.unwrap();
+        assert_eq!(ast.declarations.len(), 1);
+        match &ast.declarations[0].node {
+            Declaration::Namespace(ns) => {
+                assert_eq!(ns.name.name.as_str(), "test");
+            }
+            _ => panic!("Expected namespace declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_builtin() {
+        let source = r#"
+            javascript builtin MathAbs(context: Context, x: Number): Number {
+                return x;
+            }
+        "#;
+        let result = parse_source(source);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+        let ast = result.unwrap();
+        assert_eq!(ast.declarations.len(), 1);
+        match &ast.declarations[0].node {
+            Declaration::Builtin(b) => {
+                assert!(b.is_javascript);
+                assert_eq!(b.name.name.as_str(), "MathAbs");
+                assert_eq!(b.params.len(), 2);
+            }
+            _ => panic!("Expected builtin declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_binary_expr() {
+        let source = r#"
+            macro Test(): Number {
+                return 1 + 2 * 3;
+            }
+        "#;
+        let result = parse_source(source);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_complex_expr() {
+        let source = r#"
+            macro Complex(): Number {
+                return a + b * c - d / e && f || g;
+            }
+        "#;
+        let result = parse_source(source);
+        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+    }
 }

@@ -4,7 +4,7 @@
 
 use chumsky::prelude::*;
 use crate::ast::*;
-use crate::lexer::{Token, F64Wrapper};
+use crate::lexer::Token;
 
 type ParserInput = Vec<(Token, Span)>;
 type ParserError = Simple<Token>;
@@ -12,10 +12,7 @@ type ParserError = Simple<Token>;
 /// Main entry point: parse a source file
 pub fn parse(tokens: ParserInput) -> Result<SourceFile, Vec<ParserError>> {
     let len = tokens.len();
-    let stream = chumsky::Stream::from_iter(
-        len..len + 1,
-        tokens.into_iter(),
-    );
+    let stream = chumsky::Stream::from_iter(len..len + 1, tokens.into_iter());
     file_parser().parse(stream)
 }
 
@@ -98,14 +95,16 @@ fn type_declaration() -> impl Parser<Token, TypeDecl, Error = ParserError> + Clo
         .then(generates.or_not())
         .then(constexpr.or_not())
         .then_ignore(just(Token::Semicolon))
-        .map(|((((is_transient, name), extends), generates), constexpr)| TypeDecl {
-            name,
-            type_params: vec![],
-            extends,
-            generates,
-            constexpr,
-            is_transient,
-        })
+        .map(
+            |((((is_transient, name), extends), generates), constexpr)| TypeDecl {
+                name,
+                type_params: vec![],
+                extends,
+                generates,
+                constexpr,
+                is_transient,
+            },
+        )
 }
 
 fn builtin_decl() -> impl Parser<Token, BuiltinDecl, Error = ParserError> + Clone {
@@ -116,15 +115,17 @@ fn builtin_decl() -> impl Parser<Token, BuiltinDecl, Error = ParserError> + Clon
         .then(parameters())
         .then(return_type().or_not())
         .then(block().or_not())
-        .map(|((((is_javascript, name), params), return_type), body)| BuiltinDecl {
-            annotations: vec![],
-            is_javascript,
-            name,
-            type_params: vec![],
-            params,
-            return_type,
-            body,
-        })
+        .map(
+            |((((is_javascript, name), params), return_type), body)| BuiltinDecl {
+                annotations: vec![],
+                is_javascript,
+                name,
+                type_params: vec![],
+                params,
+                return_type,
+                body,
+            },
+        )
 }
 
 fn macro_declaration() -> impl Parser<Token, MacroDecl, Error = ParserError> + Clone {
@@ -151,7 +152,7 @@ fn const_declaration() -> impl Parser<Token, ConstDecl, Error = ParserError> + C
         .then_ignore(just(Token::Colon))
         .then(type_expr())
         .then_ignore(just(Token::Eq))
-        .then(expr().map_with_span(Spanned::new))
+        .then(expr_parser().map_with_span(Spanned::new))
         .then_ignore(just(Token::Semicolon))
         .map(|((name, type_expr), value)| ConstDecl {
             name,
@@ -190,9 +191,7 @@ fn return_type() -> impl Parser<Token, TypeExpr, Error = ParserError> + Clone {
 }
 
 fn labels_clause() -> impl Parser<Token, Vec<LabelDecl>, Error = ParserError> + Clone {
-    just(Token::Labels).ignore_then(
-        label_decl().separated_by(just(Token::Comma)).at_least(1),
-    )
+    just(Token::Labels).ignore_then(label_decl().separated_by(just(Token::Comma)).at_least(1))
 }
 
 fn label_decl() -> impl Parser<Token, LabelDecl, Error = ParserError> + Clone {
@@ -237,119 +236,121 @@ fn type_expr() -> impl Parser<Token, TypeExpr, Error = ParserError> + Clone {
 }
 
 // ============================================================================
-// Statements
+// Statements - Using boxed recursive parsers
 // ============================================================================
 
 fn block() -> impl Parser<Token, Block, Error = ParserError> + Clone {
-    statement()
-        .map_with_span(Spanned::new)
-        .repeated()
-        .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        .map(|statements| Block { statements })
-}
-
-fn statement() -> impl Parser<Token, Statement, Error = ParserError> + Clone {
-    recursive(|_stmt| {
-        let var_decl = {
-            let kw = choice((
-                just(Token::Const).to(true),
-                just(Token::Let).to(false),
-            ));
-
-            kw.then(ident())
-                .then(just(Token::Colon).ignore_then(type_expr()).or_not())
-                .then_ignore(just(Token::Eq))
-                .then(expr().map_with_span(Spanned::new))
-                .then_ignore(just(Token::Semicolon))
-                .map(|(((is_const, name), type_expr), init)| Statement::VarDecl {
-                    is_const,
-                    name,
-                    type_expr,
-                    init,
-                })
-        };
-
-        let return_stmt = just(Token::Return)
-            .ignore_then(expr().map_with_span(Spanned::new).or_not())
-            .then_ignore(just(Token::Semicolon))
-            .map(Statement::Return);
-
-        let if_stmt = just(Token::If)
-            .ignore_then(expr().delimited_by(just(Token::LParen), just(Token::RParen)))
-            .then(block())
-            .then(just(Token::Else).ignore_then(block()).or_not())
-            .map(|((cond, then_branch), else_branch)| Statement::If {
-                condition: Spanned::new(cond, 0..0),
-                then_branch,
-                else_branch,
-            });
-
-        let while_stmt = just(Token::While)
-            .ignore_then(expr().delimited_by(just(Token::LParen), just(Token::RParen)))
-            .then(block())
-            .map(|(cond, body)| Statement::While {
-                condition: Spanned::new(cond, 0..0),
-                body,
-            });
-
-        let goto_stmt = just(Token::Goto)
-            .ignore_then(ident())
-            .then(
-                expr()
-                    .map_with_span(Spanned::new)
-                    .separated_by(just(Token::Comma))
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not()
-                    .map(|a| a.unwrap_or_default()),
-            )
-            .then_ignore(just(Token::Semicolon))
-            .map(|(label, args)| Statement::Goto { label, args });
-
-        let break_stmt = just(Token::Break)
-            .then_ignore(just(Token::Semicolon))
-            .to(Statement::Break);
-
-        let continue_stmt = just(Token::Continue)
-            .then_ignore(just(Token::Semicolon))
-            .to(Statement::Continue);
-
-        let unreachable_stmt = just(Token::Unreachable)
-            .then_ignore(just(Token::Semicolon))
-            .to(Statement::Unreachable);
-
-        let typeswitch_stmt = just(Token::Typeswitch)
-            .ignore_then(expr().delimited_by(just(Token::LParen), just(Token::RParen)))
-            .then(
-                typeswitch_case()
-                    .repeated()
-                    .delimited_by(just(Token::LBrace), just(Token::RBrace)),
-            )
-            .map(|(value, cases)| Statement::Typeswitch {
-                value: Spanned::new(value, 0..0),
-                cases,
-            });
-
-        let expr_stmt = expr()
+    recursive(|block_ref| {
+        statement_inner(block_ref)
             .map_with_span(Spanned::new)
-            .then_ignore(just(Token::Semicolon))
-            .map(Statement::Expr);
-
-        choice((
-            var_decl,
-            return_stmt,
-            if_stmt,
-            while_stmt,
-            goto_stmt,
-            break_stmt,
-            continue_stmt,
-            unreachable_stmt,
-            typeswitch_stmt,
-            expr_stmt,
-        ))
+            .repeated()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace))
+            .map(|statements| Block { statements })
     })
 }
 
-fn typeswitch_case() -> impl Parser<Token, TypeswitchCase, Error = ParserError> + Clone {
+fn statement_inner(
+    block_ref: impl Parser<Token, Block, Error = ParserError> + Clone + 'static,
+) -> impl Parser<Token, Statement, Error = ParserError> + Clone {
+    let var_decl = {
+        let kw = choice((just(Token::Const).to(true), just(Token::Let).to(false)));
+
+        kw.then(ident())
+            .then(just(Token::Colon).ignore_then(type_expr()).or_not())
+            .then_ignore(just(Token::Eq))
+            .then(expr_parser().map_with_span(Spanned::new))
+            .then_ignore(just(Token::Semicolon))
+            .map(|(((is_const, name), type_expr), init)| Statement::VarDecl {
+                is_const,
+                name,
+                type_expr,
+                init,
+            })
+    };
+
+    let return_stmt = just(Token::Return)
+        .ignore_then(expr_parser().map_with_span(Spanned::new).or_not())
+        .then_ignore(just(Token::Semicolon))
+        .map(Statement::Return);
+
+    let block_ref_clone = block_ref.clone();
+    let if_stmt = just(Token::If)
+        .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
+        .then(block_ref.clone())
+        .then(just(Token::Else).ignore_then(block_ref.clone()).or_not())
+        .map(move |((cond, then_branch), else_branch)| Statement::If {
+            condition: Spanned::new(cond, 0..0),
+            then_branch,
+            else_branch,
+        });
+
+    let while_stmt = just(Token::While)
+        .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
+        .then(block_ref_clone.clone())
+        .map(|(cond, body)| Statement::While {
+            condition: Spanned::new(cond, 0..0),
+            body,
+        });
+
+    let goto_stmt = just(Token::Goto)
+        .ignore_then(ident())
+        .then(
+            expr_parser()
+                .map_with_span(Spanned::new)
+                .separated_by(just(Token::Comma))
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not()
+                .map(|a| a.unwrap_or_default()),
+        )
+        .then_ignore(just(Token::Semicolon))
+        .map(|(label, args)| Statement::Goto { label, args });
+
+    let break_stmt = just(Token::Break)
+        .then_ignore(just(Token::Semicolon))
+        .to(Statement::Break);
+
+    let continue_stmt = just(Token::Continue)
+        .then_ignore(just(Token::Semicolon))
+        .to(Statement::Continue);
+
+    let unreachable_stmt = just(Token::Unreachable)
+        .then_ignore(just(Token::Semicolon))
+        .to(Statement::Unreachable);
+
+    let typeswitch_stmt = just(Token::Typeswitch)
+        .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
+        .then(
+            typeswitch_case(block_ref_clone)
+                .repeated()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map(|(value, cases)| Statement::Typeswitch {
+            value: Spanned::new(value, 0..0),
+            cases,
+        });
+
+    let expr_stmt = expr_parser()
+        .map_with_span(Spanned::new)
+        .then_ignore(just(Token::Semicolon))
+        .map(Statement::Expr);
+
+    choice((
+        var_decl,
+        return_stmt,
+        if_stmt,
+        while_stmt,
+        goto_stmt,
+        break_stmt,
+        continue_stmt,
+        unreachable_stmt,
+        typeswitch_stmt,
+        expr_stmt,
+    ))
+}
+
+fn typeswitch_case(
+    block_ref: impl Parser<Token, Block, Error = ParserError> + Clone,
+) -> impl Parser<Token, TypeswitchCase, Error = ParserError> + Clone {
     just(Token::Case)
         .ignore_then(
             ident()
@@ -358,7 +359,7 @@ fn typeswitch_case() -> impl Parser<Token, TypeswitchCase, Error = ParserError> 
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
         )
         .then_ignore(just(Token::Colon))
-        .then(block())
+        .then(block_ref)
         .map(|((binding, type_expr), body)| TypeswitchCase {
             binding,
             type_expr,
@@ -367,12 +368,43 @@ fn typeswitch_case() -> impl Parser<Token, TypeswitchCase, Error = ParserError> 
 }
 
 // ============================================================================
-// Expressions
+// Expression Parser - Iterative Pratt-style to avoid stack overflow
 // ============================================================================
 
-fn expr() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
+/// Operator precedence levels (higher = binds tighter)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Precedence {
+    Or = 1,       // ||
+    And = 2,      // &&
+    Equality = 3, // == !=
+    Compare = 4,  // < > <= >=
+    Term = 5,     // + -
+    Factor = 6,   // * / %
+}
+
+fn get_binary_precedence(tok: &Token) -> Option<(Precedence, BinaryOp)> {
+    match tok {
+        Token::OrOr => Some((Precedence::Or, BinaryOp::Or)),
+        Token::AndAnd => Some((Precedence::And, BinaryOp::And)),
+        Token::EqEq => Some((Precedence::Equality, BinaryOp::Eq)),
+        Token::Ne => Some((Precedence::Equality, BinaryOp::Ne)),
+        Token::Lt => Some((Precedence::Compare, BinaryOp::Lt)),
+        Token::Le => Some((Precedence::Compare, BinaryOp::Le)),
+        Token::Gt => Some((Precedence::Compare, BinaryOp::Gt)),
+        Token::Ge => Some((Precedence::Compare, BinaryOp::Ge)),
+        Token::Plus => Some((Precedence::Term, BinaryOp::Add)),
+        Token::Minus => Some((Precedence::Term, BinaryOp::Sub)),
+        Token::Star => Some((Precedence::Factor, BinaryOp::Mul)),
+        Token::Slash => Some((Precedence::Factor, BinaryOp::Div)),
+        Token::Percent => Some((Precedence::Factor, BinaryOp::Mod)),
+        _ => None,
+    }
+}
+
+/// Non-recursive expression parser using Pratt parsing
+fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
     recursive(|expr| {
-        // Atoms
+        // Atoms (non-recursive base cases)
         let int_lit = filter_map(|span, tok| match tok {
             Token::IntLiteral(n) => Ok(Expr::IntLiteral(n)),
             _ => Err(Simple::expected_input_found(span, Vec::new(), Some(tok))),
@@ -384,9 +416,7 @@ fn expr() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
         });
 
         let string_lit = filter_map(|span, tok| match tok {
-            Token::StringLiteral(s) | Token::SingleStringLiteral(s) => {
-                Ok(Expr::StringLiteral(s))
-            }
+            Token::StringLiteral(s) | Token::SingleStringLiteral(s) => Ok(Expr::StringLiteral(s)),
             _ => Err(Simple::expected_input_found(span, Vec::new(), Some(tok))),
         });
 
@@ -404,7 +434,22 @@ fn expr() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
 
         let atom = choice((int_lit, float_lit, string_lit, bool_lit, paren, ident_expr));
 
-        // Postfix: function calls, field access
+        // Unary prefix operators
+        let unary_op = choice((
+            just(Token::Bang).to(UnaryOp::Not),
+            just(Token::Minus).to(UnaryOp::Neg),
+            just(Token::Tilde).to(UnaryOp::BitNot),
+        ));
+
+        let unary = unary_op
+            .repeated()
+            .then(atom)
+            .foldr(|op, e| Expr::Unary {
+                op,
+                operand: Box::new(Spanned::new(e, 0..0)),
+            });
+
+        // Postfix operations (calls, field access, indexing)
         let call_args = expr
             .clone()
             .map_with_span(Spanned::new)
@@ -412,164 +457,122 @@ fn expr() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
             .allow_trailing()
             .delimited_by(just(Token::LParen), just(Token::RParen));
 
-        let postfix = atom
-            .then(
-                choice((
-                    call_args.map(Postfix::Call),
-                    just(Token::Dot).ignore_then(ident()).map(Postfix::Field),
-                    expr.clone()
-                        .delimited_by(just(Token::LBracket), just(Token::RBracket))
-                        .map(|e| Postfix::Index(Box::new(e))),
-                ))
-                .repeated(),
-            )
-            .foldl(|base, postfix| match postfix {
-                Postfix::Call(args) => Expr::Call {
-                    callee: Box::new(Spanned::new(base, 0..0)),
-                    type_args: vec![],
-                    args,
-                    otherwise: vec![],
-                },
-                Postfix::Field(field) => Expr::FieldAccess {
-                    object: Box::new(Spanned::new(base, 0..0)),
-                    field,
-                },
-                Postfix::Index(index) => Expr::Index {
-                    object: Box::new(Spanned::new(base, 0..0)),
-                    index: Box::new(Spanned::new(*index, 0..0)),
-                },
-            });
-
-        // Unary
-        let unary = choice((
-            just(Token::Bang).to(UnaryOp::Not),
-            just(Token::Minus).to(UnaryOp::Neg),
-            just(Token::Tilde).to(UnaryOp::BitNot),
-        ))
-        .repeated()
-        .then(postfix)
-        .foldr(|op, e| Expr::Unary {
-            op,
-            operand: Box::new(Spanned::new(e, 0..0)),
+        let postfix = unary.then(
+            choice((
+                call_args.map(PostfixOp::Call),
+                just(Token::Dot).ignore_then(ident()).map(PostfixOp::Field),
+                expr.clone()
+                    .delimited_by(just(Token::LBracket), just(Token::RBracket))
+                    .map(|e| PostfixOp::Index(Box::new(e))),
+            ))
+            .repeated(),
+        )
+        .foldl(|base, op| match op {
+            PostfixOp::Call(args) => Expr::Call {
+                callee: Box::new(Spanned::new(base, 0..0)),
+                type_args: vec![],
+                args,
+                otherwise: vec![],
+            },
+            PostfixOp::Field(field) => Expr::FieldAccess {
+                object: Box::new(Spanned::new(base, 0..0)),
+                field,
+            },
+            PostfixOp::Index(index) => Expr::Index {
+                object: Box::new(Spanned::new(base, 0..0)),
+                index: Box::new(Spanned::new(*index, 0..0)),
+            },
         });
 
-        // Binary operators with precedence
-        let product = unary
+        // Binary operators - iterative precedence climbing
+        // We collect all (op, expr) pairs and then fold them respecting precedence
+        let binary_op = filter_map(|span, tok| {
+            get_binary_precedence(&tok)
+                .map(|(prec, op)| (prec, op))
+                .ok_or(Simple::expected_input_found(span, Vec::new(), Some(tok)))
+        });
+
+        let binary = postfix
             .clone()
-            .then(
-                choice((
-                    just(Token::Star).to(BinaryOp::Mul),
-                    just(Token::Slash).to(BinaryOp::Div),
-                    just(Token::Percent).to(BinaryOp::Mod),
-                ))
-                .then(unary)
-                .repeated(),
-            )
-            .foldl(|l, (op, r)| Expr::Binary {
-                op,
-                left: Box::new(Spanned::new(l, 0..0)),
-                right: Box::new(Spanned::new(r, 0..0)),
+            .then(binary_op.then(postfix).repeated())
+            .map(|(first, rest)| {
+                // Use precedence climbing algorithm iteratively
+                if rest.is_empty() {
+                    first
+                } else {
+                    build_binary_expr(first, rest)
+                }
             });
 
-        let sum = product
+        // Ternary operator
+        binary
             .clone()
             .then(
-                choice((
-                    just(Token::Plus).to(BinaryOp::Add),
-                    just(Token::Minus).to(BinaryOp::Sub),
-                ))
-                .then(product)
-                .repeated(),
+                just(Token::Question)
+                    .ignore_then(expr.clone())
+                    .then_ignore(just(Token::Colon))
+                    .then(expr)
+                    .or_not(),
             )
-            .foldl(|l, (op, r)| Expr::Binary {
-                op,
-                left: Box::new(Spanned::new(l, 0..0)),
-                right: Box::new(Spanned::new(r, 0..0)),
-            });
-
-        let comparison = sum
-            .clone()
-            .then(
-                choice((
-                    just(Token::Lt).to(BinaryOp::Lt),
-                    just(Token::Le).to(BinaryOp::Le),
-                    just(Token::Gt).to(BinaryOp::Gt),
-                    just(Token::Ge).to(BinaryOp::Ge),
-                ))
-                .then(sum)
-                .repeated(),
-            )
-            .foldl(|l, (op, r)| Expr::Binary {
-                op,
-                left: Box::new(Spanned::new(l, 0..0)),
-                right: Box::new(Spanned::new(r, 0..0)),
-            });
-
-        let equality = comparison
-            .clone()
-            .then(
-                choice((
-                    just(Token::EqEq).to(BinaryOp::Eq),
-                    just(Token::Ne).to(BinaryOp::Ne),
-                ))
-                .then(comparison)
-                .repeated(),
-            )
-            .foldl(|l, (op, r)| Expr::Binary {
-                op,
-                left: Box::new(Spanned::new(l, 0..0)),
-                right: Box::new(Spanned::new(r, 0..0)),
-            });
-
-        let logical_and = equality
-            .clone()
-            .then(
-                just(Token::AndAnd)
-                    .to(BinaryOp::And)
-                    .then(equality)
-                    .repeated(),
-            )
-            .foldl(|l, (op, r)| Expr::Binary {
-                op,
-                left: Box::new(Spanned::new(l, 0..0)),
-                right: Box::new(Spanned::new(r, 0..0)),
-            });
-
-        let logical_or = logical_and
-            .clone()
-            .then(
-                just(Token::OrOr)
-                    .to(BinaryOp::Or)
-                    .then(logical_and)
-                    .repeated(),
-            )
-            .foldl(|l, (op, r)| Expr::Binary {
-                op,
-                left: Box::new(Spanned::new(l, 0..0)),
-                right: Box::new(Spanned::new(r, 0..0)),
-            });
-
-        // Ternary
-        logical_or.clone().then(
-            just(Token::Question)
-                .ignore_then(expr.clone())
-                .then_ignore(just(Token::Colon))
-                .then(expr)
-                .or_not(),
-        )
-        .map(|(cond, ternary)| match ternary {
-            Some((then_e, else_e)) => Expr::Ternary {
-                condition: Box::new(Spanned::new(cond, 0..0)),
-                then_expr: Box::new(Spanned::new(then_e, 0..0)),
-                else_expr: Box::new(Spanned::new(else_e, 0..0)),
-            },
-            None => cond,
-        })
+            .map(|(cond, ternary)| match ternary {
+                Some((then_e, else_e)) => Expr::Ternary {
+                    condition: Box::new(Spanned::new(cond, 0..0)),
+                    then_expr: Box::new(Spanned::new(then_e, 0..0)),
+                    else_expr: Box::new(Spanned::new(else_e, 0..0)),
+                },
+                None => cond,
+            })
     })
 }
 
-enum Postfix {
+enum PostfixOp {
     Call(Vec<Spanned<Expr>>),
     Field(Ident),
     Index(Box<Expr>),
+}
+
+/// Build a binary expression tree from a flat list, respecting operator precedence
+/// Uses an iterative shunting-yard style algorithm
+fn build_binary_expr(first: Expr, rest: Vec<((Precedence, BinaryOp), Expr)>) -> Expr {
+    if rest.is_empty() {
+        return first;
+    }
+
+    // Output stack of expressions
+    let mut output: Vec<Expr> = vec![first];
+    // Operator stack
+    let mut ops: Vec<(Precedence, BinaryOp)> = Vec::new();
+
+    for ((prec, op), rhs) in rest {
+        // Pop operators with higher or equal precedence
+        while let Some(&(top_prec, top_op)) = ops.last() {
+            if top_prec >= prec {
+                ops.pop();
+                let right = output.pop().unwrap();
+                let left = output.pop().unwrap();
+                output.push(Expr::Binary {
+                    op: top_op,
+                    left: Box::new(Spanned::new(left, 0..0)),
+                    right: Box::new(Spanned::new(right, 0..0)),
+                });
+            } else {
+                break;
+            }
+        }
+        ops.push((prec, op));
+        output.push(rhs);
+    }
+
+    // Pop remaining operators
+    while let Some((_, op)) = ops.pop() {
+        let right = output.pop().unwrap();
+        let left = output.pop().unwrap();
+        output.push(Expr::Binary {
+            op,
+            left: Box::new(Spanned::new(left, 0..0)),
+            right: Box::new(Spanned::new(right, 0..0)),
+        });
+    }
+
+    output.pop().unwrap()
 }
