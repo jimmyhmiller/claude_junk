@@ -319,15 +319,14 @@ pub fn dispatch_statement<V: StmtVisitor>(
             )
         }
         Statement::Typeswitch { value, cases } => visitor.visit_typeswitch(value, cases),
-        Statement::TryLabel { try_block, labels } => visitor.visit_try_label(try_block, labels),
+        Statement::Try { body, handlers } => visitor.visit_try_label(body, handlers),
         Statement::Goto { label, args } => visitor.visit_goto(label, args),
         Statement::Break => visitor.visit_break(),
         Statement::Continue => visitor.visit_continue(),
         Statement::Unreachable => visitor.visit_unreachable(),
         Statement::Block(b) => visitor.visit_block(b),
         Statement::Tail(e) => visitor.visit_expr_stmt(e), // Treat as expr for now
-        Statement::Dcheck(e) => visitor.visit_expr_stmt(e),
-        Statement::Check(e) => visitor.visit_expr_stmt(e),
+        Statement::Assert { condition, .. } => visitor.visit_expr_stmt(condition),
     }
 }
 

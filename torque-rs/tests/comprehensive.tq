@@ -1,12 +1,59 @@
-// Comprehensive Torque test file covering all language features
+// Comprehensive Torque test file covering ALL language features
 
-// Type declarations
+// ============================================================================
+// Type declarations with generics
+// ============================================================================
+
 type Smi extends Number generates "TNode<Smi>";
 type HeapNumber extends Number generates "TNode<HeapNumber>";
 type JSArray extends JSObject generates "TNode<JSArray>";
 transient type FastJSArray extends JSArray;
 
+// Generic type
+type FixedArray<T> extends HeapObject generates "TNode<FixedArray>";
+
+// ============================================================================
+// Extern declarations
+// ============================================================================
+
+extern macro TaggedToSmi(value: Object): Smi labels Bailout;
+extern macro SmiToInt32(smi: Smi): int32;
+extern builtin ArrayPush(context: Context, receiver: Object, ...args: Object): Object;
+extern runtime ThrowTypeError(context: Context, messageId: Smi): never;
+
+// ============================================================================
+// Annotations
+// ============================================================================
+
+@export
+macro ExportedMacro(): Smi {
+    return 0;
+}
+
+@noVerifier
+@ifDebug(DEBUG)
+macro DebugOnlyMacro(): void {
+    return;
+}
+
+// ============================================================================
+// Struct declarations
+// ============================================================================
+
+struct Point {
+    x: Number;
+    y: Number;
+}
+
+struct Rectangle<T> {
+    origin: Point;
+    size: T;
+}
+
+// ============================================================================
 // Namespace with nested declarations
+// ============================================================================
+
 namespace array {
     type ElementsKind extends Smi;
 
@@ -21,7 +68,10 @@ namespace array {
     }
 }
 
+// ============================================================================
 // Macros with labels
+// ============================================================================
+
 macro TryGetElement(array: JSArray, index: Smi): JSAny labels NotFound {
     if (index >= array.length) {
         goto NotFound;
@@ -29,7 +79,29 @@ macro TryGetElement(array: JSArray, index: Smi): JSAny labels NotFound {
     return array.elements[index];
 }
 
+// ============================================================================
+// Generic macros
+// ============================================================================
+
+macro CastOrBailout<T>(value: Object): T labels Bailout {
+    if (Is<T>(value)) {
+        return UnsafeCast<T>(value);
+    }
+    goto Bailout;
+}
+
+// ============================================================================
+// Implicit parameters
+// ============================================================================
+
+macro WithImplicitContext(implicit context: Context, value: Number): Number {
+    return value;
+}
+
+// ============================================================================
 // Builtin with typeswitch
+// ============================================================================
+
 javascript builtin ArrayIndexOf(context: Context, receiver: JSAny, searchElement: JSAny, fromIndex: JSAny): Number {
     let array: JSArray = Cast<JSArray>(receiver);
     let len: Number = array.length;
@@ -50,21 +122,46 @@ javascript builtin ArrayIndexOf(context: Context, receiver: JSAny, searchElement
     return 0;
 }
 
+// ============================================================================
 // Const declarations
+// ============================================================================
+
 const kMaxArrayLength: Number = 4294967295;
 const kMinValue: Number = 0;
 
+// ============================================================================
 // Complex expressions
+// ============================================================================
+
 macro ComplexExpressions(a: Number, b: Number, c: Number): Number {
     let x: Number = a + b * c - a / b;
     let y: Number = a == b && b != c || a < c;
     let z: Number = a >= b && c <= a;
     let w: Number = !x;
     let v: Number = -a;
-    return x + y + z + w + v;
+    let u: Number = a | b & c ^ d;
+    let t: Number = a << 2 >> 1 >>> 0;
+    return x + y + z + w + v + u + t;
 }
 
+// ============================================================================
+// For loops
+// ============================================================================
+
+macro ForLoopTest(n: Number): Number {
+    let result: Number = 0;
+
+    for (let i: Number = 0; i < n; i = i + 1) {
+        result = result + i;
+    }
+
+    return result;
+}
+
+// ============================================================================
 // Nested blocks and control flow
+// ============================================================================
+
 macro ControlFlow(n: Number): Number {
     let result: Number = 0;
 
@@ -87,7 +184,32 @@ macro ControlFlow(n: Number): Number {
     return result;
 }
 
+// ============================================================================
+// Try/label blocks
+// ============================================================================
+
+macro TryLabelExample(x: Object): Number {
+    try {
+        let smi: Smi = TaggedToSmi(x) otherwise Bailout;
+        return SmiToInt32(smi);
+    } label Bailout {
+        return 0;
+    }
+}
+
+// ============================================================================
+// Otherwise clauses
+// ============================================================================
+
+macro OtherwiseExample(x: Object): Number labels Failed {
+    let result: Smi = TaggedToSmi(x) otherwise Failed;
+    return SmiToInt32(result);
+}
+
+// ============================================================================
 // Function calls and field access
+// ============================================================================
+
 macro CallsAndAccess(obj: JSObject): JSAny {
     let x: JSAny = obj.foo;
     let y: JSAny = obj.bar.baz;
@@ -98,7 +220,10 @@ macro CallsAndAccess(obj: JSObject): JSAny {
     return x;
 }
 
+// ============================================================================
 // Ternary expressions
+// ============================================================================
+
 macro TernaryExpr(cond: Boolean, a: Number, b: Number): Number {
     return cond ? a : b;
 }
@@ -108,22 +233,49 @@ macro NestedTernary(x: Number): Number {
     return x > 0 ? x > 10 ? 100 : 10 : 0;
 }
 
+// ============================================================================
+// Assertions
+// ============================================================================
+
+macro AssertionsExample(x: Number): void {
+    dcheck(x > 0);
+    check(x < 1000);
+}
+
+// ============================================================================
 // Multiple parameters and complex types
+// ============================================================================
+
 macro GenericLike(arr: FixedArray<JSAny>, index: Smi): JSAny {
     return arr[index];
 }
 
+// ============================================================================
 // Union types
+// ============================================================================
+
 macro HandleUnion(value: Number | String | Undefined): Boolean {
     return true;
 }
 
+// ============================================================================
+// Function types
+// ============================================================================
+
+type Callback extends (Number, Number) => Number;
+
+// ============================================================================
 // Deeply nested expressions
+// ============================================================================
+
 macro DeepNesting(): Number {
     return ((((1 + 2) * 3) - 4) / 5) + (((6 - 7) * 8) + 9);
 }
 
+// ============================================================================
 // Multiple labels
+// ============================================================================
+
 macro MultipleLabels(x: Number): Number labels Negative, Zero, Positive {
     if (x < 0) {
         goto Negative;
@@ -134,7 +286,10 @@ macro MultipleLabels(x: Number): Number labels Negative, Zero, Positive {
     goto Positive;
 }
 
+// ============================================================================
 // Large namespace with many declarations
+// ============================================================================
+
 namespace builtins {
     type RuntimeObject extends HeapObject;
 
@@ -159,17 +314,26 @@ namespace builtins {
     }
 }
 
+// ============================================================================
 // Stress test: many binary operators
+// ============================================================================
+
 macro StressOperators(a: Number, b: Number, c: Number, d: Number, e: Number): Number {
     return a + b - c * d / e + a * b - c + d - e + a + b + c + d + e - a - b - c - d - e;
 }
 
+// ============================================================================
 // Stress test: deeply nested calls
+// ============================================================================
+
 macro DeepCalls(): Number {
     return f(g(h(i(j(k(l(m(n(o(1))))))))));
 }
 
+// ============================================================================
 // Stress test: long chain of field access
+// ============================================================================
+
 macro LongFieldChain(obj: JSObject): JSAny {
     return obj.a.b.c.d.e.f.g.h.i.j;
 }

@@ -214,7 +214,7 @@ pub struct LabelDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     pub name: Ident,
-    pub args: Vec<Spanned<Expr>>,
+    pub args: Vec<String>,
 }
 
 // ============================================================================
@@ -270,9 +270,9 @@ pub enum Statement {
     },
 
     /// `try { ... } label Foo { ... }`
-    TryLabel {
-        try_block: Block,
-        labels: Vec<LabelBlock>,
+    Try {
+        body: Block,
+        handlers: Vec<LabelBlock>,
     },
 
     /// `goto LabelName(args);`
@@ -290,17 +290,23 @@ pub enum Statement {
     /// `tail CallExpr;`
     Tail(Spanned<Expr>),
 
-    /// `dcheck(expr);`
-    Dcheck(Spanned<Expr>),
-
-    /// `check(expr);`
-    Check(Spanned<Expr>),
+    /// `dcheck(expr);` or `check(expr);`
+    Assert {
+        kind: AssertKind,
+        condition: Spanned<Expr>,
+    },
 
     /// `unreachable;`
     Unreachable,
 
     /// Nested block `{ ... }`
     Block(Block),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertKind {
+    Dcheck,
+    Check,
 }
 
 #[derive(Debug, Clone, PartialEq)]

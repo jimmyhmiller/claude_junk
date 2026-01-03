@@ -1,6 +1,6 @@
 //! Parser for V8 Torque using chumsky
 //!
-//! Parses a token stream into an AST.
+//! Parses a token stream into an AST with full Torque language support.
 
 use chumsky::prelude::*;
 use crate::ast::*;
@@ -35,6 +35,45 @@ fn string_literal() -> impl Parser<Token, String, Error = ParserError> + Clone {
 }
 
 // ============================================================================
+// Annotations: @export, @noVerifier, @if(...), etc.
+// ============================================================================
+
+fn annotation() -> impl Parser<Token, Annotation, Error = ParserError> + Clone {
+    just(Token::At)
+        .ignore_then(ident())
+        .then(
+            // Optional arguments in parentheses
+            filter_map(|span, tok| match tok {
+                Token::Ident(s) => Ok(s),
+                Token::StringLiteral(s) => Ok(s),
+                Token::IntLiteral(n) => Ok(n.to_string()),
+                _ => Err(Simple::expected_input_found(span, Vec::new(), Some(tok))),
+            })
+            .separated_by(just(Token::Comma))
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .or_not()
+            .map(|a| a.unwrap_or_default()),
+        )
+        .map(|(name, args)| Annotation { name, args })
+}
+
+fn annotations() -> impl Parser<Token, Vec<Annotation>, Error = ParserError> + Clone {
+    annotation().repeated()
+}
+
+// ============================================================================
+// Generic Type Parameters: <T, U extends Foo>
+// ============================================================================
+
+fn type_params() -> impl Parser<Token, Vec<Ident>, Error = ParserError> + Clone {
+    ident()
+        .separated_by(just(Token::Comma))
+        .delimited_by(just(Token::Lt), just(Token::Gt))
+        .or_not()
+        .map(|p| p.unwrap_or_default())
+}
+
+// ============================================================================
 // Top-Level
 // ============================================================================
 
@@ -53,13 +92,19 @@ fn declaration() -> impl Parser<Token, Declaration, Error = ParserError> + Clone
         let builtin = builtin_decl();
         let macro_decl = macro_declaration();
         let const_decl = const_declaration();
+        let extern_decl = extern_declaration();
+        let class_decl = class_declaration(decl.clone());
+        let struct_decl = struct_declaration();
 
         choice((
             namespace.map(Declaration::Namespace),
             type_decl.map(Declaration::Type),
+            extern_decl.map(Declaration::Extern),
             builtin.map(Declaration::Builtin),
             macro_decl.map(Declaration::Macro),
             const_decl.map(Declaration::Const),
+            class_decl.map(Declaration::Class),
+            struct_decl.map(Declaration::Struct),
         ))
     })
 }
@@ -91,14 +136,15 @@ fn type_declaration() -> impl Parser<Token, TypeDecl, Error = ParserError> + Clo
     transient
         .then_ignore(just(Token::Type))
         .then(ident())
+        .then(type_params())
         .then(extends.or_not())
         .then(generates.or_not())
         .then(constexpr.or_not())
         .then_ignore(just(Token::Semicolon))
         .map(
-            |((((is_transient, name), extends), generates), constexpr)| TypeDecl {
+            |(((((is_transient, name), type_params), extends), generates), constexpr)| TypeDecl {
                 name,
-                type_params: vec![],
+                type_params,
                 extends,
                 generates,
                 constexpr,
@@ -110,40 +156,49 @@ fn type_declaration() -> impl Parser<Token, TypeDecl, Error = ParserError> + Clo
 fn builtin_decl() -> impl Parser<Token, BuiltinDecl, Error = ParserError> + Clone {
     let js = just(Token::Javascript).or_not().map(|j| j.is_some());
 
-    js.then_ignore(just(Token::Builtin))
+    annotations()
+        .then(js)
+        .then_ignore(just(Token::Builtin))
         .then(ident())
+        .then(type_params())
         .then(parameters())
         .then(return_type().or_not())
         .then(block().or_not())
         .map(
-            |((((is_javascript, name), params), return_type), body)| BuiltinDecl {
-                annotations: vec![],
-                is_javascript,
-                name,
-                type_params: vec![],
-                params,
-                return_type,
-                body,
+            |((((((annots, is_javascript), name), type_params), params), return_type), body)| {
+                BuiltinDecl {
+                    annotations: annots,
+                    is_javascript,
+                    name,
+                    type_params,
+                    params,
+                    return_type,
+                    body,
+                }
             },
         )
 }
 
 fn macro_declaration() -> impl Parser<Token, MacroDecl, Error = ParserError> + Clone {
-    just(Token::Macro)
-        .ignore_then(ident())
+    annotations()
+        .then_ignore(just(Token::Macro))
+        .then(ident())
+        .then(type_params())
         .then(parameters())
         .then(return_type().or_not())
         .then(labels_clause().or_not().map(|l| l.unwrap_or_default()))
         .then(block().or_not())
-        .map(|((((name, params), return_type), labels), body)| MacroDecl {
-            annotations: vec![],
-            name,
-            type_params: vec![],
-            params,
-            return_type,
-            labels,
-            body,
-        })
+        .map(
+            |((((((annots, name), type_params), params), return_type), labels), body)| MacroDecl {
+                annotations: annots,
+                name,
+                type_params,
+                params,
+                return_type,
+                labels,
+                body,
+            },
+        )
 }
 
 fn const_declaration() -> impl Parser<Token, ConstDecl, Error = ParserError> + Clone {
@@ -162,28 +217,203 @@ fn const_declaration() -> impl Parser<Token, ConstDecl, Error = ParserError> + C
 }
 
 // ============================================================================
+// Extern Declarations: extern macro, extern builtin, extern runtime
+// ============================================================================
+
+fn extern_declaration() -> impl Parser<Token, ExternDecl, Error = ParserError> + Clone {
+    let extern_macro = annotations()
+        .then_ignore(just(Token::Extern))
+        .then_ignore(just(Token::Macro))
+        .then(ident())
+        .then(type_params())
+        .then(parameters())
+        .then(return_type().or_not())
+        .then(labels_clause().or_not().map(|l| l.unwrap_or_default()))
+        .then_ignore(just(Token::Semicolon))
+        .map(
+            |(((((annots, name), type_params), params), return_type), labels)| MacroDecl {
+                annotations: annots,
+                name,
+                type_params,
+                params,
+                return_type,
+                labels,
+                body: None,
+            },
+        )
+        .map(ExternDecl::Macro);
+
+    let extern_builtin = annotations()
+        .then_ignore(just(Token::Extern))
+        .then(just(Token::Javascript).or_not().map(|j| j.is_some()))
+        .then_ignore(just(Token::Builtin))
+        .then(ident())
+        .then(type_params())
+        .then(parameters())
+        .then(return_type().or_not())
+        .then_ignore(just(Token::Semicolon))
+        .map(
+            |(((((annots, is_javascript), name), type_params), params), return_type)| BuiltinDecl {
+                annotations: annots,
+                is_javascript,
+                name,
+                type_params,
+                params,
+                return_type,
+                body: None,
+            },
+        )
+        .map(ExternDecl::Builtin);
+
+    let extern_runtime = just(Token::Extern)
+        .ignore_then(just(Token::Runtime))
+        .ignore_then(ident())
+        .then(parameters())
+        .then(return_type().or_not())
+        .then_ignore(just(Token::Semicolon))
+        .map(|((name, params), return_type)| RuntimeDecl {
+            name,
+            params,
+            return_type,
+        })
+        .map(ExternDecl::Runtime);
+
+    choice((extern_macro, extern_builtin, extern_runtime))
+}
+
+// ============================================================================
+// Class and Struct Declarations
+// ============================================================================
+
+fn class_declaration(
+    decl: impl Parser<Token, Declaration, Error = ParserError> + Clone,
+) -> impl Parser<Token, ClassDecl, Error = ParserError> + Clone {
+    let is_extern = just(Token::Extern).or_not().map(|e| e.is_some());
+
+    annotations()
+        .then(is_extern)
+        .then_ignore(just(Token::Class))
+        .then(ident())
+        .then(type_params())
+        .then(just(Token::Extends).ignore_then(type_expr()).or_not())
+        .then(
+            class_body(decl)
+                .or_not()
+                .map(|opt| opt.unwrap_or_else(|| (vec![], vec![]))),
+        )
+        .map(
+            |(((((annots, is_extern), name), type_params), extends), (fields, methods))| ClassDecl {
+                annotations: annots,
+                is_extern,
+                name,
+                type_params,
+                extends,
+                fields,
+                methods,
+            },
+        )
+}
+
+fn class_body(
+    decl: impl Parser<Token, Declaration, Error = ParserError> + Clone,
+) -> impl Parser<Token, (Vec<ClassField>, Vec<Spanned<Declaration>>), Error = ParserError> + Clone {
+    let field = annotations()
+        .then(just(Token::Ident("weak".to_string())).or_not().map(|w| w.is_some()))
+        .then(ident())
+        .then_ignore(just(Token::Colon))
+        .then(type_expr())
+        .then_ignore(just(Token::Semicolon))
+        .map(|(((annots, is_weak), name), type_expr)| ClassField {
+            annotations: annots,
+            name,
+            type_expr,
+            is_weak,
+        });
+
+    let method = decl.map_with_span(Spanned::new);
+
+    choice((
+        field.map(ClassBodyItem::Field),
+        method.map(ClassBodyItem::Method),
+    ))
+    .repeated()
+    .delimited_by(just(Token::LBrace), just(Token::RBrace))
+    .map(|items| {
+        let mut fields = vec![];
+        let mut methods = vec![];
+        for item in items {
+            match item {
+                ClassBodyItem::Field(f) => fields.push(f),
+                ClassBodyItem::Method(m) => methods.push(m),
+            }
+        }
+        (fields, methods)
+    })
+}
+
+enum ClassBodyItem {
+    Field(ClassField),
+    Method(Spanned<Declaration>),
+}
+
+fn struct_declaration() -> impl Parser<Token, StructDecl, Error = ParserError> + Clone {
+    just(Token::Struct)
+        .ignore_then(ident())
+        .then(type_params())
+        .then(
+            struct_field()
+                .repeated()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map(|((name, type_params), fields)| StructDecl {
+            name,
+            type_params,
+            fields,
+        })
+}
+
+fn struct_field() -> impl Parser<Token, StructField, Error = ParserError> + Clone {
+    ident()
+        .then_ignore(just(Token::Colon))
+        .then(type_expr())
+        .then_ignore(just(Token::Semicolon))
+        .map(|(name, type_expr)| StructField { name, type_expr })
+}
+
+// ============================================================================
 // Parameters and Types
 // ============================================================================
 
 fn parameters() -> impl Parser<Token, Vec<Parameter>, Error = ParserError> + Clone {
-    parameter()
+    // Handle both implicit and regular parameters
+    let implicit_param = just(Token::Implicit)
+        .ignore_then(ident())
+        .then_ignore(just(Token::Colon))
+        .then(type_expr())
+        .map(|(name, type_expr)| Parameter {
+            name,
+            type_expr,
+            is_implicit: true,
+            is_rest: false,
+        });
+
+    let regular_param = {
+        let rest = just(Token::Ellipsis).or_not().map(|r| r.is_some());
+        rest.then(ident())
+            .then_ignore(just(Token::Colon))
+            .then(type_expr())
+            .map(|((is_rest, name), type_expr)| Parameter {
+                name,
+                type_expr,
+                is_implicit: false,
+                is_rest,
+            })
+    };
+
+    choice((implicit_param, regular_param))
         .separated_by(just(Token::Comma))
         .allow_trailing()
         .delimited_by(just(Token::LParen), just(Token::RParen))
-}
-
-fn parameter() -> impl Parser<Token, Parameter, Error = ParserError> + Clone {
-    let rest = just(Token::Ellipsis).or_not().map(|r| r.is_some());
-
-    rest.then(ident())
-        .then_ignore(just(Token::Colon))
-        .then(type_expr())
-        .map(|((is_rest, name), type_expr)| Parameter {
-            name,
-            type_expr,
-            is_implicit: false,
-            is_rest,
-        })
 }
 
 fn return_type() -> impl Parser<Token, TypeExpr, Error = ParserError> + Clone {
@@ -218,7 +448,19 @@ fn type_expr() -> impl Parser<Token, TypeExpr, Error = ParserError> + Clone {
             )
             .map(|(name, args)| TypeExpr::Generic { name, args });
 
-        let base = generic.or(named);
+        // Function type: (A, B) => C
+        let func_type = ty
+            .clone()
+            .separated_by(just(Token::Comma))
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .then_ignore(just(Token::FatArrow))
+            .then(ty.clone())
+            .map(|(params, ret)| TypeExpr::Function {
+                params,
+                return_type: Box::new(ret),
+            });
+
+        let base = choice((func_type, generic, named));
 
         // Union types: A | B
         base.clone()
@@ -274,6 +516,10 @@ fn statement_inner(
         .map(Statement::Return);
 
     let block_ref_clone = block_ref.clone();
+    let block_ref_clone2 = block_ref.clone();
+    let block_ref_clone3 = block_ref.clone();
+    let block_ref_clone4 = block_ref.clone();
+
     let if_stmt = just(Token::If)
         .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
         .then(block_ref.clone())
@@ -289,6 +535,44 @@ fn statement_inner(
         .then(block_ref_clone.clone())
         .map(|(cond, body)| Statement::While {
             condition: Spanned::new(cond, 0..0),
+            body,
+        });
+
+    // For loop: for (init; cond; update) { ... }
+    let for_init = choice((
+        {
+            let kw = choice((just(Token::Const).to(true), just(Token::Let).to(false)));
+            kw.then(ident())
+                .then(just(Token::Colon).ignore_then(type_expr()).or_not())
+                .then_ignore(just(Token::Eq))
+                .then(expr_parser().map_with_span(Spanned::new))
+                .map(|(((is_const, name), type_expr), init)| Statement::VarDecl {
+                    is_const,
+                    name,
+                    type_expr,
+                    init,
+                })
+                .map_with_span(|s, span| Some(Box::new(Spanned::new(s, span))))
+        },
+        expr_parser()
+            .map_with_span(|e, span| Statement::Expr(Spanned::new(e, span)))
+            .map_with_span(|s, span| Some(Box::new(Spanned::new(s, span)))),
+        just(Token::Semicolon).to(()).rewind().to(None),
+    ));
+
+    let for_stmt = just(Token::For)
+        .ignore_then(just(Token::LParen))
+        .ignore_then(for_init)
+        .then_ignore(just(Token::Semicolon))
+        .then(expr_parser().map_with_span(Spanned::new).or_not())
+        .then_ignore(just(Token::Semicolon))
+        .then(expr_parser().map_with_span(Spanned::new).or_not())
+        .then_ignore(just(Token::RParen))
+        .then(block_ref_clone2.clone())
+        .map(|(((init, condition), update), body)| Statement::For {
+            init,
+            condition,
+            update,
             body,
         });
 
@@ -320,13 +604,36 @@ fn statement_inner(
     let typeswitch_stmt = just(Token::Typeswitch)
         .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
         .then(
-            typeswitch_case(block_ref_clone)
+            typeswitch_case(block_ref_clone3.clone())
                 .repeated()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
         )
         .map(|(value, cases)| Statement::Typeswitch {
             value: Spanned::new(value, 0..0),
             cases,
+        });
+
+    // Try with label blocks: try { ... } label Fail { ... }
+    let try_stmt = just(Token::Try)
+        .ignore_then(block_ref_clone4.clone())
+        .then(label_block(block_ref_clone4).repeated())
+        .map(|(body, handlers)| Statement::Try { body, handlers });
+
+    // Assertions: dcheck(...); check(...);
+    let dcheck_stmt = just(Token::Dcheck)
+        .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
+        .then_ignore(just(Token::Semicolon))
+        .map(|e| Statement::Assert {
+            kind: AssertKind::Dcheck,
+            condition: Spanned::new(e, 0..0),
+        });
+
+    let check_stmt = just(Token::Check)
+        .ignore_then(expr_parser().delimited_by(just(Token::LParen), just(Token::RParen)))
+        .then_ignore(just(Token::Semicolon))
+        .map(|e| Statement::Assert {
+            kind: AssertKind::Check,
+            condition: Spanned::new(e, 0..0),
         });
 
     let expr_stmt = expr_parser()
@@ -339,13 +646,47 @@ fn statement_inner(
         return_stmt,
         if_stmt,
         while_stmt,
+        for_stmt,
         goto_stmt,
         break_stmt,
         continue_stmt,
         unreachable_stmt,
         typeswitch_stmt,
+        try_stmt,
+        dcheck_stmt,
+        check_stmt,
         expr_stmt,
     ))
+}
+
+fn label_block(
+    block_ref: impl Parser<Token, Block, Error = ParserError> + Clone,
+) -> impl Parser<Token, LabelBlock, Error = ParserError> + Clone {
+    just(Token::Label)
+        .ignore_then(ident())
+        .then(
+            parameter()
+                .separated_by(just(Token::Comma))
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not()
+                .map(|p| p.unwrap_or_default()),
+        )
+        .then(block_ref)
+        .map(|((name, params), body)| LabelBlock { name, params, body })
+}
+
+fn parameter() -> impl Parser<Token, Parameter, Error = ParserError> + Clone {
+    let rest = just(Token::Ellipsis).or_not().map(|r| r.is_some());
+
+    rest.then(ident())
+        .then_ignore(just(Token::Colon))
+        .then(type_expr())
+        .map(|((is_rest, name), type_expr)| Parameter {
+            name,
+            type_expr,
+            is_implicit: false,
+            is_rest,
+        })
 }
 
 fn typeswitch_case(
@@ -377,10 +718,14 @@ enum Precedence {
     Assign = 0,   // = (right-associative, lowest precedence)
     Or = 1,       // ||
     And = 2,      // &&
-    Equality = 3, // == !=
-    Compare = 4,  // < > <= >=
-    Term = 5,     // + -
-    Factor = 6,   // * / %
+    BitOr = 3,    // |
+    BitXor = 4,   // ^
+    BitAnd = 5,   // &
+    Equality = 6, // == !=
+    Compare = 7,  // < > <= >=
+    Shift = 8,    // << >> >>>
+    Term = 9,     // + -
+    Factor = 10,  // * / %
 }
 
 fn get_binary_precedence(tok: &Token) -> Option<(Precedence, BinaryOp)> {
@@ -388,12 +733,18 @@ fn get_binary_precedence(tok: &Token) -> Option<(Precedence, BinaryOp)> {
         Token::Eq => Some((Precedence::Assign, BinaryOp::Assign)),
         Token::OrOr => Some((Precedence::Or, BinaryOp::Or)),
         Token::AndAnd => Some((Precedence::And, BinaryOp::And)),
+        Token::Pipe => Some((Precedence::BitOr, BinaryOp::BitOr)),
+        Token::Caret => Some((Precedence::BitXor, BinaryOp::BitXor)),
+        Token::Amp => Some((Precedence::BitAnd, BinaryOp::BitAnd)),
         Token::EqEq => Some((Precedence::Equality, BinaryOp::Eq)),
         Token::Ne => Some((Precedence::Equality, BinaryOp::Ne)),
         Token::Lt => Some((Precedence::Compare, BinaryOp::Lt)),
         Token::Le => Some((Precedence::Compare, BinaryOp::Le)),
         Token::Gt => Some((Precedence::Compare, BinaryOp::Gt)),
         Token::Ge => Some((Precedence::Compare, BinaryOp::Ge)),
+        Token::Shl => Some((Precedence::Shift, BinaryOp::Shl)),
+        Token::Shr => Some((Precedence::Shift, BinaryOp::Shr)),
+        Token::Ushr => Some((Precedence::Shift, BinaryOp::Ushr)),
         Token::Plus => Some((Precedence::Term, BinaryOp::Add)),
         Token::Minus => Some((Precedence::Term, BinaryOp::Sub)),
         Token::Star => Some((Precedence::Factor, BinaryOp::Mul)),
@@ -451,6 +802,19 @@ fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
                 operand: Box::new(Spanned::new(e, 0..0)),
             });
 
+        // Generic type arguments for calls: Foo<T>(...)
+        let type_args = type_expr()
+            .separated_by(just(Token::Comma))
+            .delimited_by(just(Token::Lt), just(Token::Gt))
+            .or_not()
+            .map(|a| a.unwrap_or_default());
+
+        // Otherwise clause for calls: Call() otherwise Label
+        let otherwise_clause = just(Token::Otherwise)
+            .ignore_then(ident().separated_by(just(Token::Comma)).at_least(1))
+            .or_not()
+            .map(|o| o.unwrap_or_default());
+
         // Postfix operations (calls, field access, indexing)
         let call_args = expr
             .clone()
@@ -461,7 +825,16 @@ fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
 
         let postfix = unary.then(
             choice((
-                call_args.map(PostfixOp::Call),
+                // Generic call with otherwise: Foo<T>(...) otherwise Label
+                type_args
+                    .clone()
+                    .then(call_args.clone())
+                    .then(otherwise_clause.clone())
+                    .map(|((type_args, args), otherwise)| PostfixOp::GenericCall {
+                        type_args,
+                        args,
+                        otherwise,
+                    }),
                 just(Token::Dot).ignore_then(ident()).map(PostfixOp::Field),
                 expr.clone()
                     .delimited_by(just(Token::LBracket), just(Token::RBracket))
@@ -470,11 +843,15 @@ fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
             .repeated(),
         )
         .foldl(|base, op| match op {
-            PostfixOp::Call(args) => Expr::Call {
-                callee: Box::new(Spanned::new(base, 0..0)),
-                type_args: vec![],
+            PostfixOp::GenericCall {
+                type_args,
                 args,
-                otherwise: vec![],
+                otherwise,
+            } => Expr::Call {
+                callee: Box::new(Spanned::new(base, 0..0)),
+                type_args,
+                args,
+                otherwise,
             },
             PostfixOp::Field(field) => Expr::FieldAccess {
                 object: Box::new(Spanned::new(base, 0..0)),
@@ -487,7 +864,6 @@ fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
         });
 
         // Binary operators - iterative precedence climbing
-        // We collect all (op, expr) pairs and then fold them respecting precedence
         let binary_op = filter_map(|span, tok| {
             get_binary_precedence(&tok)
                 .map(|(prec, op)| (prec, op))
@@ -498,7 +874,6 @@ fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
             .clone()
             .then(binary_op.then(postfix).repeated())
             .map(|(first, rest)| {
-                // Use precedence climbing algorithm iteratively
                 if rest.is_empty() {
                     first
                 } else {
@@ -528,25 +903,25 @@ fn expr_parser() -> impl Parser<Token, Expr, Error = ParserError> + Clone {
 }
 
 enum PostfixOp {
-    Call(Vec<Spanned<Expr>>),
+    GenericCall {
+        type_args: Vec<TypeExpr>,
+        args: Vec<Spanned<Expr>>,
+        otherwise: Vec<Ident>,
+    },
     Field(Ident),
     Index(Box<Expr>),
 }
 
 /// Build a binary expression tree from a flat list, respecting operator precedence
-/// Uses an iterative shunting-yard style algorithm
 fn build_binary_expr(first: Expr, rest: Vec<((Precedence, BinaryOp), Expr)>) -> Expr {
     if rest.is_empty() {
         return first;
     }
 
-    // Output stack of expressions
     let mut output: Vec<Expr> = vec![first];
-    // Operator stack
     let mut ops: Vec<(Precedence, BinaryOp)> = Vec::new();
 
     for ((prec, op), rhs) in rest {
-        // Pop operators with higher or equal precedence
         while let Some(&(top_prec, top_op)) = ops.last() {
             if top_prec >= prec {
                 ops.pop();
@@ -565,7 +940,6 @@ fn build_binary_expr(first: Expr, rest: Vec<((Precedence, BinaryOp), Expr)>) -> 
         output.push(rhs);
     }
 
-    // Pop remaining operators
     while let Some((_, op)) = ops.pop() {
         let right = output.pop().unwrap();
         let left = output.pop().unwrap();
