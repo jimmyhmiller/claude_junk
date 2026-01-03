@@ -1,0 +1,175 @@
+// Comprehensive Torque test file covering all language features
+
+// Type declarations
+type Smi extends Number generates "TNode<Smi>";
+type HeapNumber extends Number generates "TNode<HeapNumber>";
+type JSArray extends JSObject generates "TNode<JSArray>";
+transient type FastJSArray extends JSArray;
+
+// Namespace with nested declarations
+namespace array {
+    type ElementsKind extends Smi;
+
+    macro GetElementsKind(array: JSArray): ElementsKind {
+        return array.elements_kind;
+    }
+
+    builtin ArrayPush(context: Context, receiver: JSAny, ...args: JSAny): Number {
+        let array: JSArray = Cast<JSArray>(receiver);
+        let len: Number = array.length;
+        return len;
+    }
+}
+
+// Macros with labels
+macro TryGetElement(array: JSArray, index: Smi): JSAny labels NotFound {
+    if (index >= array.length) {
+        goto NotFound;
+    }
+    return array.elements[index];
+}
+
+// Builtin with typeswitch
+javascript builtin ArrayIndexOf(context: Context, receiver: JSAny, searchElement: JSAny, fromIndex: JSAny): Number {
+    let array: JSArray = Cast<JSArray>(receiver);
+    let len: Number = array.length;
+    let k: Number = 0;
+
+    typeswitch (searchElement) {
+        case (n: Number): {
+            return n;
+        }
+        case (s: String): {
+            return 0;
+        }
+        case (o: JSObject): {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// Const declarations
+const kMaxArrayLength: Number = 4294967295;
+const kMinValue: Number = 0;
+
+// Complex expressions
+macro ComplexExpressions(a: Number, b: Number, c: Number): Number {
+    let x: Number = a + b * c - a / b;
+    let y: Number = a == b && b != c || a < c;
+    let z: Number = a >= b && c <= a;
+    let w: Number = !x;
+    let v: Number = -a;
+    return x + y + z + w + v;
+}
+
+// Nested blocks and control flow
+macro ControlFlow(n: Number): Number {
+    let result: Number = 0;
+
+    if (n > 0) {
+        result = 1;
+    } else {
+        result = 0;
+    }
+
+    while (n > 0) {
+        result = result + 1;
+        if (result > 100) {
+            break;
+        }
+        if (result == 50) {
+            continue;
+        }
+    }
+
+    return result;
+}
+
+// Function calls and field access
+macro CallsAndAccess(obj: JSObject): JSAny {
+    let x: JSAny = obj.foo;
+    let y: JSAny = obj.bar.baz;
+    let z: JSAny = SomeFunction(x, y);
+    let w: JSAny = obj.method(1, 2, 3);
+    let v: JSAny = array[0];
+    let u: JSAny = matrix[i][j];
+    return x;
+}
+
+// Ternary expressions
+macro TernaryExpr(cond: Boolean, a: Number, b: Number): Number {
+    return cond ? a : b;
+}
+
+// Nested ternary
+macro NestedTernary(x: Number): Number {
+    return x > 0 ? x > 10 ? 100 : 10 : 0;
+}
+
+// Multiple parameters and complex types
+macro GenericLike(arr: FixedArray<JSAny>, index: Smi): JSAny {
+    return arr[index];
+}
+
+// Union types
+macro HandleUnion(value: Number | String | Undefined): Boolean {
+    return true;
+}
+
+// Deeply nested expressions
+macro DeepNesting(): Number {
+    return ((((1 + 2) * 3) - 4) / 5) + (((6 - 7) * 8) + 9);
+}
+
+// Multiple labels
+macro MultipleLabels(x: Number): Number labels Negative, Zero, Positive {
+    if (x < 0) {
+        goto Negative;
+    }
+    if (x == 0) {
+        goto Zero;
+    }
+    goto Positive;
+}
+
+// Large namespace with many declarations
+namespace builtins {
+    type RuntimeObject extends HeapObject;
+
+    macro RuntimeCall1(): Undefined {
+        return Undefined;
+    }
+
+    macro RuntimeCall2(): Undefined {
+        return Undefined;
+    }
+
+    macro RuntimeCall3(): Undefined {
+        return Undefined;
+    }
+
+    builtin RuntimeBuiltin1(context: Context): Undefined {
+        return Undefined;
+    }
+
+    builtin RuntimeBuiltin2(context: Context): Undefined {
+        return Undefined;
+    }
+}
+
+// Stress test: many binary operators
+macro StressOperators(a: Number, b: Number, c: Number, d: Number, e: Number): Number {
+    return a + b - c * d / e + a * b - c + d - e + a + b + c + d + e - a - b - c - d - e;
+}
+
+// Stress test: deeply nested calls
+macro DeepCalls(): Number {
+    return f(g(h(i(j(k(l(m(n(o(1))))))))));
+}
+
+// Stress test: long chain of field access
+macro LongFieldChain(obj: JSObject): JSAny {
+    return obj.a.b.c.d.e.f.g.h.i.j;
+}

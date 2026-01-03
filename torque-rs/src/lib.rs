@@ -375,4 +375,29 @@ mod tests {
         let result = parse_source(source);
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
     }
+
+    #[test]
+    fn test_parse_comprehensive_file() {
+        let source = include_str!("../tests/comprehensive.tq");
+        let result = parse_source(source);
+        assert!(result.is_ok(), "Failed to parse comprehensive.tq: {:?}", result.err());
+        let ast = result.unwrap();
+        // Should have multiple top-level declarations
+        assert!(ast.declarations.len() > 10, "Expected many declarations, got {}", ast.declarations.len());
+    }
+
+    #[test]
+    fn test_parse_stress_test_file() {
+        let source = include_str!("../tests/stress_test.tq");
+        println!("Parsing {} bytes, {} lines", source.len(), source.lines().count());
+        let start = std::time::Instant::now();
+        let result = parse_source(source);
+        let elapsed = start.elapsed();
+        println!("Parsing took {:?}", elapsed);
+        assert!(result.is_ok(), "Failed to parse stress_test.tq: {:?}", result.err());
+        let ast = result.unwrap();
+        println!("Parsed {} declarations", ast.declarations.len());
+        // Should have 200 types + 200 consts + 400 macros + 200 builtins + 50 namespaces = 1050
+        assert!(ast.declarations.len() >= 1000, "Expected ~1050 declarations, got {}", ast.declarations.len());
+    }
 }

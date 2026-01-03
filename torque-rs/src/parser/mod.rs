@@ -374,6 +374,7 @@ fn typeswitch_case(
 /// Operator precedence levels (higher = binds tighter)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Precedence {
+    Assign = 0,   // = (right-associative, lowest precedence)
     Or = 1,       // ||
     And = 2,      // &&
     Equality = 3, // == !=
@@ -384,6 +385,7 @@ enum Precedence {
 
 fn get_binary_precedence(tok: &Token) -> Option<(Precedence, BinaryOp)> {
     match tok {
+        Token::Eq => Some((Precedence::Assign, BinaryOp::Assign)),
         Token::OrOr => Some((Precedence::Or, BinaryOp::Or)),
         Token::AndAnd => Some((Precedence::And, BinaryOp::And)),
         Token::EqEq => Some((Precedence::Equality, BinaryOp::Eq)),

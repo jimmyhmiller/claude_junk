@@ -436,6 +436,8 @@ pub enum Expr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
+    // Assignment
+    Assign,
     // Arithmetic
     Add, Sub, Mul, Div, Mod,
     // Comparison
