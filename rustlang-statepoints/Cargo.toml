@@ -6,9 +6,10 @@ edition = "2021"
 [dependencies]
 inkwell = { git = "https://github.com/jimmyhmiller/inkwell.git", features = ["llvm18-1"] }
 libc = "0.2"
-mmtk = { version = "0.31", features = ["single_worker"] }
+mmtk = { version = "0.31", features = ["work_packet_stats"] }
 log = "0.4"
 env_logger = "0.11"
+stack-walker = { path = "../../PlayGround/claude-experiments/stack-walker" }
 
 [features]
 default = []

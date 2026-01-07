@@ -12,6 +12,7 @@
 mod tagged_value;
 mod stackmap;
 mod mmtk_binding;
+mod gc_runtime;
 #[macro_use]
 mod lang;
 
@@ -25,9 +26,16 @@ fn run() {
     use crate::stackmap::StackMap;
     use crate::lang::Compiler;
 
-    println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║   Binary Trees Benchmark with MMTk GC                            ║");
-    println!("╚══════════════════════════════════════════════════════════════════╝\n");
+    let use_fib_banner = std::env::var("STATEPOINT_FIB").is_ok();
+    if use_fib_banner {
+        println!("╔══════════════════════════════════════════════════════════════════╗");
+        println!("║   Fibonacci Benchmark                                            ║");
+        println!("╚══════════════════════════════════════════════════════════════════╝\n");
+    } else {
+        println!("╔══════════════════════════════════════════════════════════════════╗");
+        println!("║   Binary Trees Benchmark with MMTk GC                            ║");
+        println!("╚══════════════════════════════════════════════════════════════════╝\n");
+    }
 
     let use_mini = std::env::var("STATEPOINT_MINI").is_ok();
 
@@ -40,7 +48,48 @@ fn run() {
     // - node.left = (car node)
     // - node.right = (cdr node)
     // - node.left === null becomes (null? (car node))
-    let program = if use_mini {
+    let use_simple = std::env::var("STATEPOINT_SIMPLE").is_ok();
+    let use_fib = std::env::var("STATEPOINT_FIB").is_ok();
+
+    let program = if use_fib {
+        // Fibonacci benchmark - pure computation (no GC allocations)
+        // Tests recursive function call overhead and JIT quality
+        lang!(
+            (do
+                (defn fib (n)
+                    (if (<= n 1)
+                        n
+                        (+ (call fib (- n 1))
+                           (call fib (- n 2)))))
+
+                // Get N from command line (default 35)
+                (let n (max 1 (get-arg 1))
+                    (do
+                        (print (call fib n))))))
+    } else if use_simple {
+        // Test with nested cons cells - requires GC to update heap pointers
+        lang!(
+            (do
+                // Create nested structure: ((1 . 2) . (3 . 4))
+                (let inner1 (cons 1 2)
+                    (let inner2 (cons 3 4)
+                        (let outer (cons inner1 inner2)
+                            (do
+                                // Verify structure before GC
+                                (print (car (car outer)))  // Should print 1
+                                (print (cdr (car outer)))  // Should print 2
+                                (print (car (cdr outer)))  // Should print 3
+                                (print (cdr (cdr outer)))  // Should print 4
+                                (set-global-root outer)
+                                (gc)  // Force GC - pointers should be updated
+                                // Verify structure after GC
+                                (print (car (car outer)))  // Should print 1
+                                (print (cdr (car outer)))  // Should print 2
+                                (print (car (cdr outer)))  // Should print 3
+                                (print (cdr (cdr outer)))  // Should print 4
+                                (clear-global-root)))))))
+    } else if use_mini {
+        // STATEPOINT_MINI_DEPTH controls the tree depth (default 1)
         lang!(
             (do
                 (defn bottom_up_tree (depth)
@@ -55,13 +104,14 @@ fn run() {
                         (+ 1 (+ (call item_check (car node))
                                 (call item_check (cdr node))))))
 
-                (let longLivedTree (call bottom_up_tree 1)
-                    (do
-                        (set-global-root longLivedTree)
-                        (gc)
-                        (print-long-lived-check 1
-                            (call item_check longLivedTree))
-                        (clear-global-root)))))
+                (let treeDepth (get-arg 1)
+                    (let longLivedTree (call bottom_up_tree treeDepth)
+                        (do
+                            (set-global-root longLivedTree)
+                            (gc)
+                            (print-long-lived-check treeDepth
+                                (call item_check longLivedTree))
+                            (clear-global-root))))))
     } else {
         lang!(
             (do
@@ -202,17 +252,27 @@ fn run() {
     Target::initialize_native(&InitializationConfig::default())
         .expect("Failed to initialize native target");
 
-    // ===== Initialize MMTk =====
-    mmtk_binding::init_mmtk();
-    mmtk_binding::bind_mutator();
+    // ===== Initialize GC =====
+    let use_simple_gc = std::env::var("SIMPLE_GC").is_ok();
 
-    // Get runtime symbols
-    let symbols = mmtk_binding::get_all_runtime_symbols();
+    let simple_symbols;
+    let mmtk_symbols;
+
+    if use_simple_gc {
+        gc_runtime::init();
+        simple_symbols = Some(gc_runtime::get_simple_runtime_symbols());
+        mmtk_symbols = None;
+    } else {
+        mmtk_binding::init_mmtk();
+        mmtk_binding::bind_mutator();
+        mmtk_symbols = Some(mmtk_binding::get_all_runtime_symbols());
+        simple_symbols = None;
+    }
 
     // ===== Compile Program =====
     println!("Compiling...");
     let context = Context::create();
-    let mut compiler = Compiler::new(&context, "lang_demo");
+    let mut compiler = Compiler::new_with_gc_mode(&context, "lang_demo", use_simple_gc);
     compiler.compile_function("main", &program);
 
     let (module, rt_fns) = compiler.finish();
@@ -282,77 +342,110 @@ fn run() {
     };
 
     // Add runtime function mappings
-    ee.add_global_mapping(&rt_fns.cons_fn, symbols.cons);
-    ee.add_global_mapping(&rt_fns.gc_fn, symbols.gc);
-    ee.add_global_mapping(&rt_fns.car_fn, symbols.car);
-    ee.add_global_mapping(&rt_fns.cdr_fn, symbols.cdr);
-    ee.add_global_mapping(&rt_fns.set_global_root_fn, symbols.set_global_root);
-    ee.add_global_mapping(&rt_fns.clear_global_root_fn, symbols.clear_global_root);
-    ee.add_global_mapping(&rt_fns.print_fn, symbols.print);
-    ee.add_global_mapping(&rt_fns.print_list_fn, symbols.print_list);
-    ee.add_global_mapping(&rt_fns.print_stretch_check_fn, symbols.print_stretch_check);
-    ee.add_global_mapping(&rt_fns.print_trees_check_fn, symbols.print_trees_check);
-    ee.add_global_mapping(&rt_fns.print_long_lived_check_fn, symbols.print_long_lived_check);
-    ee.add_global_mapping(&rt_fns.get_arg_fn, symbols.get_arg);
-    ee.add_global_mapping(&rt_fns.max_fn, symbols.max);
+    if let Some(ref symbols) = mmtk_symbols {
+        ee.add_global_mapping(&rt_fns.cons_fn, symbols.cons);
+        ee.add_global_mapping(&rt_fns.cons_safepoint_fn, symbols.cons_safepoint);
+        ee.add_global_mapping(&rt_fns.gc_fn, symbols.gc);
+        ee.add_global_mapping(&rt_fns.car_fn, symbols.car);
+        ee.add_global_mapping(&rt_fns.cdr_fn, symbols.cdr);
+        ee.add_global_mapping(&rt_fns.set_global_root_fn, symbols.set_global_root);
+        ee.add_global_mapping(&rt_fns.clear_global_root_fn, symbols.clear_global_root);
+        ee.add_global_mapping(&rt_fns.print_fn, symbols.print);
+        ee.add_global_mapping(&rt_fns.print_list_fn, symbols.print_list);
+        ee.add_global_mapping(&rt_fns.print_stretch_check_fn, symbols.print_stretch_check);
+        ee.add_global_mapping(&rt_fns.print_trees_check_fn, symbols.print_trees_check);
+        ee.add_global_mapping(&rt_fns.print_long_lived_check_fn, symbols.print_long_lived_check);
+        ee.add_global_mapping(&rt_fns.get_arg_fn, symbols.get_arg);
+        ee.add_global_mapping(&rt_fns.max_fn, symbols.max);
+    } else if let Some(ref symbols) = simple_symbols {
+        // Simple GC uses try_alloc_cons which returns NULL if heap is full
+        ee.add_global_mapping(&rt_fns.try_alloc_cons_fn, symbols.try_alloc_cons);
+        ee.add_global_mapping(&rt_fns.gc_fn, symbols.gc);
+        ee.add_global_mapping(&rt_fns.gc_with_frame_info_fn, symbols.gc_with_frame_info);
+        ee.add_global_mapping(&rt_fns.car_fn, symbols.car);
+        ee.add_global_mapping(&rt_fns.cdr_fn, symbols.cdr);
+        ee.add_global_mapping(&rt_fns.set_global_root_fn, symbols.set_global_root);
+        ee.add_global_mapping(&rt_fns.clear_global_root_fn, symbols.clear_global_root);
+        // Simple GC uses the same print/utility functions from mmtk_binding
+        ee.add_global_mapping(&rt_fns.print_fn, mmtk_binding::rt_print as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_list_fn, mmtk_binding::rt_print_list as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_stretch_check_fn, mmtk_binding::rt_print_stretch_check as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_trees_check_fn, mmtk_binding::rt_print_trees_check as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_long_lived_check_fn, mmtk_binding::rt_print_long_lived_check as *const () as usize);
+        ee.add_global_mapping(&rt_fns.get_arg_fn, mmtk_binding::rt_get_arg as *const () as usize);
+        ee.add_global_mapping(&rt_fns.max_fn, mmtk_binding::rt_max as *const () as usize);
+    }
 
     // Get function pointer
     let main_fn = ee.get_function_address("main").expect("No main function");
 
-    // Load stackmaps
-    let (stackmap_addr, stackmap_size) = MM_STATE.lock().unwrap().stackmaps.unwrap();
-    let stackmap_data = unsafe { std::slice::from_raw_parts(stackmap_addr as *const u8, stackmap_size) };
-    let mut stackmap = StackMap::parse(stackmap_data).expect("Failed to parse stackmap");
-    let code_sections = MM_STATE.lock().unwrap().code_sections.clone();
-    let mut is_absolute = false;
-    for func in &stackmap.functions {
-        if code_sections.iter().any(|(addr, size)| {
-            let start = *addr as u64;
-            let end = start + *size as u64;
-            func.address >= start && func.address < end
-        }) {
-            is_absolute = true;
-            break;
-        }
-    }
-    if !is_absolute {
-        let mut base = None;
-        for (addr, size) in &code_sections {
-            let start = *addr as u64;
-            let end = start + *size as u64;
-            if (main_fn as u64) >= start && (main_fn as u64) < end {
-                base = Some(start);
+    // Load stackmaps - both MMTk and simple GC need them for stack walking
+    let stackmap_info = MM_STATE.lock().unwrap().stackmaps;
+    if let Some((stackmap_addr, stackmap_size)) = stackmap_info {
+        let stackmap_data = unsafe { std::slice::from_raw_parts(stackmap_addr as *const u8, stackmap_size) };
+        let mut stackmap = StackMap::parse(stackmap_data).expect("Failed to parse stackmap");
+        let code_sections = MM_STATE.lock().unwrap().code_sections.clone();
+        let mut is_absolute = false;
+        for func in &stackmap.functions {
+            if code_sections.iter().any(|(addr, size)| {
+                let start = *addr as u64;
+                let end = start + *size as u64;
+                func.address >= start && func.address < end
+            }) {
+                is_absolute = true;
                 break;
             }
         }
-        let base = base.or_else(|| code_sections.iter().map(|(addr, _)| *addr as u64).min()).unwrap_or(0);
-        if base != 0 {
-            for func in &mut stackmap.functions {
-                func.address += base;
+        if !is_absolute {
+            let mut base = None;
+            for (addr, size) in &code_sections {
+                let start = *addr as u64;
+                let end = start + *size as u64;
+                if (main_fn as u64) >= start && (main_fn as u64) < end {
+                    base = Some(start);
+                    break;
+                }
             }
-            for record in &mut stackmap.records {
-                record.absolute_offset += base;
+            let base = base.or_else(|| code_sections.iter().map(|(addr, _)| *addr as u64).min()).unwrap_or(0);
+            if base != 0 {
+                for func in &mut stackmap.functions {
+                    func.address += base;
+                }
+                for record in &mut stackmap.records {
+                    record.absolute_offset += base;
+                }
             }
         }
-    }
-    mmtk_binding::load_stackmaps(stackmap, main_fn);
 
-    // Enable MMTk collection BEFORE execution so GC can actually happen
-    mmtk_binding::enable_collection();
+        if use_simple_gc {
+            // Load stackmaps for simple GC stack walking
+            gc_runtime::load_stackmaps(stackmap, main_fn);
+        } else {
+            mmtk_binding::load_stackmaps(stackmap, main_fn);
+            // Enable MMTk collection BEFORE execution so GC can actually happen
+            mmtk_binding::enable_collection();
+        }
+    } else if !use_simple_gc {
+        // MMTk without stackmaps - still enable collection
+        mmtk_binding::enable_collection();
+    }
 
     // ===== Execute =====
     println!("Running benchmark...\n");
-    let gc_stats = std::env::var("GC_STATS").is_ok();
+    let gc_stats = std::env::var("GC_STATS").is_ok() && !use_simple_gc;
     if gc_stats {
         mmtk_binding::start_gc_stats();
     }
     let jit_main: extern "C" fn() -> u64 = unsafe { std::mem::transmute(main_fn) };
+    let start_time = std::time::Instant::now();
     let _result = jit_main();
+    let elapsed = start_time.elapsed();
     if gc_stats {
         mmtk_binding::end_gc_stats();
     }
 
-    println!("\nDone.");
+    println!("\nElapsed: {:.3}ms", elapsed.as_secs_f64() * 1000.0);
+    println!("Done.");
 }
 
 fn main() {

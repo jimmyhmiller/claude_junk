@@ -218,9 +218,12 @@ macro_rules! lang {
 /// Runtime function references for global mapping
 pub struct RuntimeFunctions<'ctx> {
     pub cons_fn: FunctionValue<'ctx>,
+    pub cons_safepoint_fn: FunctionValue<'ctx>,
+    pub try_alloc_cons_fn: FunctionValue<'ctx>,
     pub car_fn: FunctionValue<'ctx>,
     pub cdr_fn: FunctionValue<'ctx>,
     pub gc_fn: FunctionValue<'ctx>,
+    pub gc_with_frame_info_fn: FunctionValue<'ctx>,
     pub print_fn: FunctionValue<'ctx>,
     pub print_list_fn: FunctionValue<'ctx>,
     pub print_stretch_check_fn: FunctionValue<'ctx>,
@@ -243,9 +246,16 @@ pub struct Compiler<'ctx> {
 
     // Runtime functions
     cons_fn: FunctionValue<'ctx>,
+    cons_safepoint_fn: FunctionValue<'ctx>,  // Safepoint-based cons for MMTk
+    try_alloc_cons_fn: FunctionValue<'ctx>,  // For simple GC: returns NULL if need GC
     car_fn: FunctionValue<'ctx>,
     cdr_fn: FunctionValue<'ctx>,
     gc_fn: FunctionValue<'ctx>,
+    gc_with_roots_fn: FunctionValue<'ctx>,   // For simple GC: takes root slot pointers
+    gc_with_frame_info_fn: FunctionValue<'ctx>,  // For simple GC with stack walking
+    frameaddress_fn: FunctionValue<'ctx>,
+    stacksave_fn: FunctionValue<'ctx>,
+    returnaddress_fn: FunctionValue<'ctx>,
     print_fn: FunctionValue<'ctx>,
     print_list_fn: FunctionValue<'ctx>,
     print_stretch_check_fn: FunctionValue<'ctx>,
@@ -264,10 +274,17 @@ pub struct Compiler<'ctx> {
 
     // Current function being compiled
     current_fn: Option<FunctionValue<'ctx>>,
+
+    // Use simple GC with retry loop (vs MMTk with deferred GC)
+    use_simple_gc: bool,
 }
 
 impl<'ctx> Compiler<'ctx> {
     pub fn new(context: &'ctx Context, module_name: &str) -> Self {
+        Self::new_with_gc_mode(context, module_name, false)
+    }
+
+    pub fn new_with_gc_mode(context: &'ctx Context, module_name: &str, use_simple_gc: bool) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
 
@@ -279,6 +296,13 @@ impl<'ctx> Compiler<'ctx> {
         // Use gc_ptr_type for parameters so LLVM tracks them as GC pointers
         let cons_fn = module.add_function(
             "rt_cons_raw_mmtk",
+            gc_ptr_type.fn_type(&[gc_ptr_type.into(), gc_ptr_type.into()], false),
+            None,
+        );
+
+        // For simple GC: try_alloc returns NULL if heap is full
+        let try_alloc_cons_fn = module.add_function(
+            "rt_try_alloc_cons",
             gc_ptr_type.fn_type(&[gc_ptr_type.into(), gc_ptr_type.into()], false),
             None,
         );
@@ -298,6 +322,51 @@ impl<'ctx> Compiler<'ctx> {
         let gc_fn = module.add_function(
             "rt_gc_mmtk",
             void_type.fn_type(&[], false),
+            None,
+        );
+
+        // For simple GC: takes pointers to root slots so GC can update them
+        let ptr_type = context.ptr_type(inkwell::AddressSpace::default());
+        let gc_with_roots_fn = module.add_function(
+            "rt_gc_with_roots",
+            void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+
+        // Safepoint-based cons for MMTk: takes slot pointers and frame info
+        let cons_safepoint_fn = module.add_function(
+            "rt_cons_raw_mmtk_safepoint",
+            gc_ptr_type.fn_type(&[
+                ptr_type.into(),    // car_slot
+                ptr_type.into(),    // cdr_slot
+                i64_type.into(),    // fp
+                i64_type.into(),    // sp
+                i64_type.into(),    // ra
+            ], false),
+            None,
+        );
+
+        // For simple GC with stack walking: takes frame info (fp, sp, ra)
+        let gc_with_frame_info_fn = module.add_function(
+            "rt_gc_with_frame_info",
+            void_type.fn_type(&[i64_type.into(), i64_type.into(), i64_type.into()], false),
+            None,
+        );
+
+        // LLVM intrinsics for getting frame info
+        let frameaddress_fn = module.add_function(
+            "llvm.frameaddress.p0",
+            ptr_type.fn_type(&[context.i32_type().into()], false),
+            None,
+        );
+        let stacksave_fn = module.add_function(
+            "llvm.stacksave.p0",
+            ptr_type.fn_type(&[], false),
+            None,
+        );
+        let returnaddress_fn = module.add_function(
+            "llvm.returnaddress",
+            ptr_type.fn_type(&[context.i32_type().into()], false),
             None,
         );
 
@@ -359,9 +428,16 @@ impl<'ctx> Compiler<'ctx> {
             builder,
             gc_ptr_type,
             cons_fn,
+            cons_safepoint_fn,
+            try_alloc_cons_fn,
             car_fn,
             cdr_fn,
             gc_fn,
+            gc_with_roots_fn,
+            gc_with_frame_info_fn,
+            frameaddress_fn,
+            stacksave_fn,
+            returnaddress_fn,
             print_fn,
             print_list_fn,
             print_stretch_check_fn,
@@ -372,6 +448,7 @@ impl<'ctx> Compiler<'ctx> {
             get_arg_fn,
             max_fn,
             variables: HashMap::new(),
+            use_simple_gc,
             user_functions: HashMap::new(),
             current_fn: None,
         }
@@ -381,9 +458,12 @@ impl<'ctx> Compiler<'ctx> {
     pub fn finish(self) -> (Module<'ctx>, RuntimeFunctions<'ctx>) {
         let rt = RuntimeFunctions {
             cons_fn: self.cons_fn,
+            cons_safepoint_fn: self.cons_safepoint_fn,
+            try_alloc_cons_fn: self.try_alloc_cons_fn,
             car_fn: self.car_fn,
             cdr_fn: self.cdr_fn,
             gc_fn: self.gc_fn,
+            gc_with_frame_info_fn: self.gc_with_frame_info_fn,
             print_fn: self.print_fn,
             print_list_fn: self.print_list_fn,
             print_stretch_check_fn: self.print_stretch_check_fn,
@@ -515,15 +595,143 @@ impl<'ctx> Compiler<'ctx> {
                 let car_ptr = self.compile_expr(car);
                 let cdr_ptr = self.compile_expr(cdr);
                 let live = self.spill_live_gc_ptrs();
-                // Pass GC pointers directly so LLVM tracks them at this safepoint
-                let result = self.builder
-                    .build_call(self.cons_fn, &[car_ptr.into(), cdr_ptr.into()], "cons")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_pointer_value();
-                self.restore_live_gc_ptrs(&live);
-                result
+
+                if self.use_simple_gc {
+                    // Simple GC: Use retry loop pattern with stack walking
+                    // 1. Store car/cdr in stack slots (stackmap will track them)
+                    // 2. Try to allocate
+                    // 3. If NULL, get frame info and trigger GC at safepoint
+                    // 4. GC walks stack using stackmap to find all roots
+                    let car_slot = self.build_alloca_in_entry("car_slot");
+                    let cdr_slot = self.build_alloca_in_entry("cdr_slot");
+                    self.builder.build_store(car_slot, car_ptr).unwrap();
+                    self.builder.build_store(cdr_slot, cdr_ptr).unwrap();
+
+                    let current_fn = self.current_fn.unwrap();
+                    let retry_bb = self.context.append_basic_block(current_fn, "retry");
+                    let need_gc_bb = self.context.append_basic_block(current_fn, "need_gc");
+                    let done_bb = self.context.append_basic_block(current_fn, "done");
+
+                    self.builder.build_unconditional_branch(retry_bb).unwrap();
+
+                    // retry:
+                    self.builder.position_at_end(retry_bb);
+                    let car_val = self.builder
+                        .build_load(self.gc_ptr_type, car_slot, "car_val")
+                        .unwrap()
+                        .into_pointer_value();
+                    let cdr_val = self.builder
+                        .build_load(self.gc_ptr_type, cdr_slot, "cdr_val")
+                        .unwrap()
+                        .into_pointer_value();
+                    let result = self.builder
+                        .build_call(self.try_alloc_cons_fn, &[car_val.into(), cdr_val.into()], "try_cons")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let is_null = self.builder.build_is_null(result, "is_null").unwrap();
+                    self.builder.build_conditional_branch(is_null, need_gc_bb, done_bb).unwrap();
+
+                    // need_gc: Get frame info and call GC with stack walking
+                    self.builder.position_at_end(need_gc_bb);
+                    let i64_type = self.context.i64_type();
+                    let i32_type = self.context.i32_type();
+                    let zero = i32_type.const_int(0, false);
+
+                    // Get frame pointer
+                    let fp_ptr = self.builder
+                        .build_call(self.frameaddress_fn, &[zero.into()], "fp_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let fp = self.builder.build_ptr_to_int(fp_ptr, i64_type, "fp").unwrap();
+
+                    // Get stack pointer
+                    let sp_ptr = self.builder
+                        .build_call(self.stacksave_fn, &[], "sp_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let sp = self.builder.build_ptr_to_int(sp_ptr, i64_type, "sp").unwrap();
+
+                    // Get return address
+                    let ra_ptr = self.builder
+                        .build_call(self.returnaddress_fn, &[zero.into()], "ra_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let ra = self.builder.build_ptr_to_int(ra_ptr, i64_type, "ra").unwrap();
+
+                    // Call GC with frame info for stack walking
+                    self.builder.build_call(
+                        self.gc_with_frame_info_fn,
+                        &[fp.into(), sp.into(), ra.into()],
+                        "gc"
+                    ).unwrap();
+                    self.builder.build_unconditional_branch(retry_bb).unwrap();
+
+                    // done:
+                    self.builder.position_at_end(done_bb);
+                    self.restore_live_gc_ptrs(&live);
+                    result
+                } else {
+                    // MMTk: Use safepoint-based allocation with frame info
+                    // Store car/cdr in stack slots so GC can find and update them via stackmap
+                    let car_slot = self.build_alloca_in_entry("car_slot");
+                    let cdr_slot = self.build_alloca_in_entry("cdr_slot");
+                    self.builder.build_store(car_slot, car_ptr).unwrap();
+                    self.builder.build_store(cdr_slot, cdr_ptr).unwrap();
+
+                    let i64_type = self.context.i64_type();
+                    let i32_type = self.context.i32_type();
+                    let zero = i32_type.const_int(0, false);
+
+                    // Get frame pointer
+                    let fp_ptr = self.builder
+                        .build_call(self.frameaddress_fn, &[zero.into()], "fp_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let fp = self.builder.build_ptr_to_int(fp_ptr, i64_type, "fp").unwrap();
+
+                    // Get stack pointer
+                    let sp_ptr = self.builder
+                        .build_call(self.stacksave_fn, &[], "sp_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let sp = self.builder.build_ptr_to_int(sp_ptr, i64_type, "sp").unwrap();
+
+                    // Get return address
+                    let ra_ptr = self.builder
+                        .build_call(self.returnaddress_fn, &[zero.into()], "ra_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    let ra = self.builder.build_ptr_to_int(ra_ptr, i64_type, "ra").unwrap();
+
+                    // Call safepoint-based cons with slot pointers and frame info
+                    // The function reads car/cdr from slots AFTER allocation (in case GC updated them)
+                    let result = self.builder
+                        .build_call(
+                            self.cons_safepoint_fn,
+                            &[car_slot.into(), cdr_slot.into(), fp.into(), sp.into(), ra.into()],
+                            "cons"
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    self.restore_live_gc_ptrs(&live);
+                    result
+                }
             }
 
             Expr::Car(e) => {

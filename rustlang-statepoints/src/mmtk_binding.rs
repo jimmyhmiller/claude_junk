@@ -40,6 +40,7 @@ fn gc_timing_enabled() -> bool {
 }
 
 static GC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 macro_rules! gc_log {
     ($($t:tt)*) => {
@@ -110,6 +111,53 @@ pub struct StatepointState {
     pub current_regs: Option<usize>,
     pub stack_low: usize,
     pub stack_high: usize,
+}
+
+/// Frame state stored in atomics for fast access (no mutex needed)
+use std::sync::atomic::AtomicPtr;
+
+static FRAME_FP: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static FRAME_SP: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static FRAME_RA: AtomicUsize = AtomicUsize::new(0);
+static FRAME_REGS: AtomicUsize = AtomicUsize::new(0);
+
+/// Stack bounds stored atomically for fast access during GC slot updates
+static STACK_LOW: AtomicUsize = AtomicUsize::new(0);
+static STACK_HIGH: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+fn set_frame_atomics(fp: *const u8, sp: *const u8, ra: usize, regs: Option<usize>) {
+    // Use Relaxed ordering - GC will do a full synchronization anyway
+    FRAME_FP.store(fp as *mut u8, Ordering::Relaxed);
+    FRAME_SP.store(sp as *mut u8, Ordering::Relaxed);
+    FRAME_RA.store(ra, Ordering::Relaxed);
+    FRAME_REGS.store(regs.unwrap_or(0), Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn get_frame_atomics() -> Option<FrameInfo> {
+    let fp = FRAME_FP.load(Ordering::Acquire);
+    let sp = FRAME_SP.load(Ordering::Acquire);
+    let ra = FRAME_RA.load(Ordering::Acquire);
+    if fp.is_null() && sp.is_null() && ra == 0 {
+        None
+    } else {
+        Some(FrameInfo { fp, sp, return_addr: ra })
+    }
+}
+
+#[inline(always)]
+fn get_regs_atomics() -> Option<usize> {
+    let regs = FRAME_REGS.load(Ordering::Acquire);
+    if regs == 0 { None } else { Some(regs) }
+}
+
+#[inline(always)]
+fn clear_frame_atomics() {
+    FRAME_FP.store(std::ptr::null_mut(), Ordering::Release);
+    FRAME_SP.store(std::ptr::null_mut(), Ordering::Release);
+    FRAME_RA.store(0, Ordering::Release);
+    FRAME_REGS.store(0, Ordering::Release);
 }
 
 #[derive(Clone)]
@@ -305,9 +353,43 @@ impl Slot for TaggedSlot {
     }
 
     fn store(&self, object: ObjectReference) {
+        // Skip store if SKIP_STORE is set (for debugging)
+        if std::env::var("SKIP_STORE").is_ok() {
+            return;
+        }
+
+        let slot_addr = self.addr.as_usize();
         let old_val = unsafe { *(self.addr.to_ptr::<TaggedValue>()) };
         let ptr = object.to_raw_address().as_usize() as TaggedValue;
-        let _ = old_val;
+
+        // Get actual stack bounds from atomics (fast)
+        let stack_low = STACK_LOW.load(Ordering::Acquire);
+        let stack_high = STACK_HIGH.load(Ordering::Acquire);
+
+        // Classify the slot address:
+        // - Heap: Use MMTk's actual vm_layout bounds
+        // - Stack: between stack_low and stack_high (determined at bind_mutator)
+        // - Global: everything else (static variables, etc.)
+        let layout = vm_layout();
+        let is_heap = slot_addr >= layout.heap_start.as_usize() && slot_addr < layout.heap_end.as_usize();
+        let is_stack = stack_low > 0 && slot_addr >= stack_low && slot_addr < stack_high;
+
+        if std::env::var("SLOT_TRACE").is_ok() && old_val != ptr {
+            let loc = if is_heap { "heap" } else if is_stack { "stack" } else { "global" };
+            eprintln!("SLOT UPDATE {}: {:#x} old={:#x} new={:#x}", loc, slot_addr, old_val, ptr);
+        }
+
+        // Control which slots to update for debugging
+        if std::env::var("HEAP_ONLY").is_ok() {
+            if !is_heap {
+                return;
+            }
+        }
+
+        if std::env::var("NO_STACK").is_ok() && is_stack {
+            return;
+        }
+
         // ptr should already have tag 000 since heap pointers are 8-byte aligned
         unsafe {
             *(self.addr.to_mut_ptr::<TaggedValue>()) = ptr;
@@ -437,9 +519,15 @@ fn conservative_scan_frame(
     frame_start: usize,
     frame_end: usize,
 ) -> usize {
+    // Limit to avoid stack overflow in MMTk tracing
+    let max_roots = std::env::var("STATEPOINT_MAX_ROOTS_PER_FRAME")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10);
+
     let mut added = 0usize;
     let mut addr = frame_start;
-    while addr + 8 <= frame_end {
+    while addr + 8 <= frame_end && added < max_roots {
         let val = unsafe { std::ptr::read_unaligned(addr as *const u64) };
         if is_probable_heap_ptr(val) {
             let slot_addr = unsafe { Address::from_usize(addr) };
@@ -456,6 +544,12 @@ fn is_valid_object_ref(addr: Address) -> bool {
         return false;
     }
     let layout = vm_layout();
+    // Log layout once for debugging
+    static LAYOUT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LAYOUT_LOGGED.swap(true, Ordering::Relaxed) && std::env::var("HEAP_LAYOUT").is_ok() {
+        eprintln!("HEAP LAYOUT: start={:#x} end={:#x}", layout.heap_start, layout.heap_end);
+    }
+
     if addr < layout.heap_start || addr >= layout.heap_end {
         return false;
     }
@@ -477,6 +571,43 @@ impl Scanning<StatepointVM> for StatepointScanning {
         mut factory: impl RootsWorkFactory<TaggedSlot>,
     ) {
         gc_log!("GC: scan_roots_in_mutator_thread called");
+
+        // Minimal mode: only scan global root and top frame's saved registers
+        // This avoids stack overflow in MMTk tracing while still maintaining correctness
+        if std::env::var("STATEPOINT_MINIMAL_ROOTS").is_ok() {
+            let mut slots = Vec::new();
+
+            // Scan global root
+            if unsafe { GLOBAL_ROOT } != 0 {
+                let addr = unsafe { Address::from_mut_ptr(&raw mut GLOBAL_ROOT as *mut TaggedValue) };
+                slots.push(TaggedSlot::new(addr));
+                gc_log!("GC: minimal mode - added global root");
+            }
+
+            // Scan saved registers from the current frame (if available)
+            if let Some(regs_ptr) = get_regs_atomics() {
+                let regs = regs_ptr as *const usize;
+                let mut reg_roots = 0;
+                // Scan all general purpose registers (x0-x28 on AArch64)
+                for i in 0..29 {
+                    let reg_val = unsafe { *regs.add(i) };
+                    if is_probable_heap_ptr(reg_val as u64) {
+                        let reg_slot_addr = unsafe { Address::from_usize(regs_ptr + i * 8) };
+                        slots.push(TaggedSlot::new(reg_slot_addr));
+                        reg_roots += 1;
+                    }
+                }
+                gc_log!("GC: minimal mode - added {} register roots", reg_roots);
+            } else {
+                gc_log!("GC: minimal mode - no regs available");
+            }
+
+            gc_log!("GC: minimal mode - total {} roots", slots.len());
+            if !slots.is_empty() {
+                factory.create_process_roots_work(slots);
+            }
+            return;
+        }
 
         let state = statepoint_state();
         if state.is_none() {
@@ -508,9 +639,9 @@ impl Scanning<StatepointVM> for StatepointScanning {
             slots.push(TaggedSlot::new(addr));
         }
 
-        // Get the initial frame saved when entering rt_cons
-        let initial = match &state_ref.current_frame {
-            Some(f) => f.clone(),
+        // Get the initial frame saved when entering rt_cons (from atomics - fast!)
+        let initial = match get_frame_atomics() {
+            Some(f) => f,
             None => {
                 gc_log!("GC: no current_frame!");
                 if !slots.is_empty() {
@@ -599,12 +730,35 @@ impl Scanning<StatepointVM> for StatepointScanning {
                 );
 
                 let regs_for_frame = if frame_depth == 1 {
-                    state_ref.current_regs
+                    get_regs_atomics()
                 } else {
                     None
                 };
-                for (i, (base_loc, derived_loc)) in gc_locs.iter().enumerate() {
-                    gc_log!("    loc[{}]: reg={} offset={}", i, derived_loc.reg, derived_loc.offset);
+
+                // For the first frame (where cons was called), also add the saved registers
+                // x0 and x1 (car/cdr parameters) as roots since they're not tracked by statepoint
+                if frame_depth == 1 {
+                    if let Some(regs_ptr) = regs_for_frame {
+                        let regs = regs_ptr as *const usize;
+                        // Scan x0 and x1 (the car/cdr parameters to cons)
+                        for reg_idx in 0..2 {
+                            let reg_val = unsafe { *regs.add(reg_idx) };
+                            if is_heap_ptr(reg_val as TaggedValue) {
+                                let reg_slot_addr = unsafe { Address::from_usize(regs_ptr + reg_idx * 8) };
+                                if std::env::var("ROOT_ADDR_TRACE").is_ok() {
+                                    eprintln!("REG ROOT: x{} addr={:#x} val={:#x}", reg_idx, reg_slot_addr.as_usize(), reg_val);
+                                }
+                                slots.push(TaggedSlot::new(reg_slot_addr));
+                                precise_roots += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Use precise scanning from statepoints by default
+                let use_precise = std::env::var("SKIP_PRECISE").is_err();
+                for (_i, (base_loc, derived_loc)) in gc_locs.iter().enumerate() {
+                    if !use_precise { continue; }
                     let mut addr = resolve_location(
                         derived_loc,
                         current_fp as *const u8,
@@ -631,6 +785,9 @@ impl Scanning<StatepointVM> for StatepointScanning {
                         gc_log!("    -> slot at {:?} = {:#x}", addr, val);
 
                         if is_heap_ptr(val as TaggedValue) {
+                            if std::env::var("ROOT_ADDR_TRACE").is_ok() {
+                                eprintln!("ROOT: addr={:#x} val={:#x}", addr.as_usize(), val);
+                            }
                             gc_log!("      -> ADDED as root!");
                             slots.push(TaggedSlot::new(addr));
                             precise_roots += 1;
@@ -638,14 +795,20 @@ impl Scanning<StatepointVM> for StatepointScanning {
                     }
                 }
             }
-            if precise_roots == 0 && std::env::var("STATEPOINT_DISABLE_CONSERVATIVE").is_err() {
+            // Only use conservative scanning if precise found nothing AND it's explicitly enabled
+            if precise_roots == 0 && std::env::var("STATEPOINT_ENABLE_CONSERVATIVE").is_ok() {
                 let frame_end = (current_sp + layout.stack_size).min(stack_high);
                 conservative_scan_frame(&mut slots, current_sp, frame_end);
             }
 
             frame_depth += 1;
-            if frame_depth > 100 {
-                gc_log!("GC: Frame chain too deep, stopping");
+            // Limit frame depth to avoid stack overflow in MMTk tracing
+            let max_frame_depth = std::env::var("STATEPOINT_MAX_FRAME_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(100);
+            if frame_depth > max_frame_depth {
+                gc_log!("GC: Frame chain too deep, stopping at {}", max_frame_depth);
                 break;
             }
 
@@ -693,13 +856,17 @@ impl Scanning<StatepointVM> for StatepointScanning {
             // (handled above)
         }
 
-        if std::env::var("STATEPOINT_DISABLE_CONSERVATIVE").is_err() {
+        // Conservative tail scanning only if explicitly enabled
+        if std::env::var("STATEPOINT_ENABLE_CONSERVATIVE").is_ok() {
+            const MAX_CONSERVATIVE_SCAN: usize = 16 * 1024;
             if frame_depth <= 1 {
-                conservative_scan_frame(&mut slots, initial.sp as usize, stack_high);
+                let scan_end = (initial.sp as usize + MAX_CONSERVATIVE_SCAN).min(stack_high);
+                conservative_scan_frame(&mut slots, initial.sp as usize, scan_end);
             } else if let Some(start) = tail_scan_start {
                 let scan_start = start.max(stack_low);
-                if scan_start < stack_high {
-                    conservative_scan_frame(&mut slots, scan_start, stack_high);
+                let scan_end = (scan_start + MAX_CONSERVATIVE_SCAN).min(stack_high);
+                if scan_start < scan_end {
+                    conservative_scan_frame(&mut slots, scan_start, scan_end);
                 }
             }
         }
@@ -865,14 +1032,17 @@ fn resolve_location(
         return None;
     }
     match loc.ty {
-        LocationType::Direct => Some(Address::from_ptr(addr)),
-        LocationType::Indirect => {
-            let slot_addr = unsafe { std::ptr::read_unaligned(addr as *const usize) };
-            if slot_addr == 0 {
-                None
-            } else {
-                Some(unsafe { Address::from_usize(slot_addr) })
-            }
+        LocationType::Direct | LocationType::Indirect => {
+            // For both Direct and Indirect:
+            // - Direct: the GC pointer is stored at `addr`
+            // - Indirect: `addr` contains a pointer, but for our purposes,
+            //   the SLOT we need to track is still `addr` because that's
+            //   where the stack variable lives that we need to update
+            //
+            // The key insight: we want the SLOT address (where to update),
+            // not the value at that address. TaggedSlot::load will read
+            // the value, and TaggedSlot::store will update it.
+            Some(Address::from_ptr(addr))
         }
         _ => None,
     }
@@ -899,13 +1069,8 @@ impl Collection<StatepointVM> for StatepointCollection {
     }
 
     fn resume_mutators(_tls: VMWorkerThread) {
-        // Clear frame info now that GC is complete
-        if let Ok(mut state) = STATEPOINT_STATE.lock() {
-            if let Some(ref mut s) = *state {
-                s.current_frame = None;
-                s.current_regs = None;
-            }
-        }
+        // Clear frame info now that GC is complete (using atomics - fast!)
+        clear_frame_atomics();
         // Signal that GC is complete
         let (lock, cvar) = &GC_SYNC;
         let mut gc_done = lock.lock().unwrap();
@@ -930,25 +1095,29 @@ impl Collection<StatepointVM> for StatepointCollection {
     }
 
     fn spawn_gc_thread(_tls: VMThread, ctx: GCThreadContext<StatepointVM>) {
-        // Spawn a GC worker thread
+        // Spawn a GC worker thread with a large stack for deep object graphs
         match ctx {
             GCThreadContext::Worker(worker) => {
-                let handle = std::thread::spawn(move || {
-                    // Create a valid TLS for this worker thread.
-                    // We allocate a small struct on the heap and use its address as TLS.
-                    // This must live for the duration of the worker.
-                    let tls_data = Box::new(WorkerThreadData { _marker: () });
-                    let tls_ptr = Box::into_raw(tls_data);
-                    let worker_tls = VMWorkerThread(VMThread(OpaquePointer::from_address(
-                        unsafe { Address::from_usize(tls_ptr as usize) }
-                    )));
+                let handle = std::thread::Builder::new()
+                    .name("mmtk-gc-worker".to_string())
+                    .stack_size(64 * 1024 * 1024) // 64MB stack for deep object tracing
+                    .spawn(move || {
+                        // Create a valid TLS for this worker thread.
+                        // We allocate a small struct on the heap and use its address as TLS.
+                        // This must live for the duration of the worker.
+                        let tls_data = Box::new(WorkerThreadData { _marker: () });
+                        let tls_ptr = Box::into_raw(tls_data);
+                        let worker_tls = VMWorkerThread(VMThread(OpaquePointer::from_address(
+                            unsafe { Address::from_usize(tls_ptr as usize) }
+                        )));
 
-                    // Run the GC worker
-                    worker.run(worker_tls, mmtk());
+                        // Run the GC worker
+                        worker.run(worker_tls, mmtk());
 
-                    // Clean up TLS data (worker.run() only returns on shutdown)
-                    unsafe { drop(Box::from_raw(tls_ptr)); }
-                });
+                        // Clean up TLS data (worker.run() only returns on shutdown)
+                        unsafe { drop(Box::from_raw(tls_ptr)); }
+                    })
+                    .expect("Failed to spawn GC worker thread");
 
                 // Store the handle for potential later joining
                 if let Ok(mut handles) = GC_WORKER_THREADS.lock() {
@@ -1108,6 +1277,11 @@ pub fn bind_mutator() {
         let stack_size = unsafe { libc::pthread_get_stacksize_np(pthread) };
         let stack_high = unsafe { libc::pthread_get_stackaddr_np(pthread) } as usize;
         let stack_low = stack_high.saturating_sub(stack_size);
+        eprintln!("Mutator thread stack: size={}MB, low={:#x}, high={:#x}",
+            stack_size / 1024 / 1024, stack_low, stack_high);
+        // Store in atomics for fast access during GC
+        STACK_LOW.store(stack_low, Ordering::Release);
+        STACK_HIGH.store(stack_high, Ordering::Release);
         if let Ok(mut state) = STATEPOINT_STATE.lock() {
             if let Some(ref mut s) = *state {
                 s.stack_low = stack_low;
@@ -1129,7 +1303,150 @@ pub fn start_gc_stats() {
 }
 
 pub fn end_gc_stats() {
+    use std::io::{self, BufRead, Write};
+    use std::os::unix::io::FromRawFd;
+
+    // Create a pipe to capture stdout
+    let mut pipe_fds = [0i32; 2];
+    unsafe {
+        libc::pipe(pipe_fds.as_mut_ptr());
+    }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+
+    // Save original stdout
+    let original_stdout = unsafe { libc::dup(1) };
+
+    // Redirect stdout to our pipe
+    unsafe {
+        libc::dup2(write_fd, 1);
+        libc::close(write_fd);
+    }
+
+    // Call harness_end (which prints to stdout)
     mmtk().harness_end();
+
+    // Flush stdout
+    io::stdout().flush().ok();
+
+    // Restore original stdout
+    unsafe {
+        libc::dup2(original_stdout, 1);
+        libc::close(original_stdout);
+    }
+
+    // Read captured output
+    let mut captured = String::new();
+    let read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let mut reader = io::BufReader::new(read_file);
+
+    // Set read to non-blocking and read available data
+    unsafe {
+        let flags = libc::fcntl(read_fd, libc::F_GETFL);
+        libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => captured.push_str(&line),
+        }
+    }
+
+    // Parse and print formatted stats
+    print_gc_summary_from_output(&captured);
+}
+
+fn print_gc_summary_from_output(output: &str) {
+    let lines: Vec<&str> = output.lines().collect();
+
+    // Find header and data lines
+    let mut header_line = None;
+    let mut data_line = None;
+    let mut total_time = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("GC\t") {
+            header_line = Some(*line);
+            if i + 1 < lines.len() {
+                data_line = Some(lines[i + 1]);
+            }
+        }
+        if line.starts_with("Total time:") {
+            total_time = Some(*line);
+        }
+    }
+
+    // Always print raw output for debugging
+    if std::env::var("GC_RAW_STATS").is_ok() {
+        print!("{}", output);
+        return;
+    }
+
+    if header_line.is_none() || data_line.is_none() {
+        // Fall back to printing raw output
+        print!("{}", output);
+        return;
+    }
+
+    let headers: Vec<&str> = header_line.unwrap().split('\t').collect();
+    let values: Vec<&str> = data_line.unwrap().split('\t').collect();
+
+    let stats: std::collections::HashMap<&str, &str> =
+        headers.iter().cloned().zip(values.iter().cloned()).collect();
+
+    println!("\n╔══════════════════════════════════════════════════════════════════╗");
+    println!("║                        GC Statistics                             ║");
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+
+    let gc_cycles: i64 = stats.get("GC").and_then(|s| s.parse().ok()).unwrap_or(0);
+    println!("║  GC Cycles:         {:>10}                                  ║", gc_cycles);
+
+    let mutator: f64 = stats.get("time.other").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let stw: f64 = stats.get("time.stw").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let total = mutator + stw;
+    let stw_pct = if total > 0.0 { stw / total * 100.0 } else { 0.0 };
+
+    println!("║  Mutator Time:      {:>10.2} ms                              ║", mutator);
+    println!("║  STW Time:          {:>10.2} ms  ({:>5.1}%)                    ║", stw, stw_pct);
+
+    // Warn if GC is thrashing (0 cycles but high STW time)
+    if gc_cycles == 0 && stw > 1000.0 {
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!("║  ⚠ WARNING: GC started but never finished! (OOM)                ║");
+        println!("║    Heap too small to complete collection - increase GC_HEAP_MB  ║");
+    }
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+
+    if let Some(count) = stats.get("total-work.count") {
+        println!("║  Work Packets:      {:>10}                                  ║", count);
+    }
+
+    // Find PlanProcessEdges stats (main GC work)
+    let mut edge_count = None;
+    let mut edge_time = None;
+    for (k, v) in &stats {
+        if k.contains("PlanProcessEdges.count") {
+            edge_count = Some(*v);
+        }
+        if k.contains("PlanProcessEdges.time.total") {
+            edge_time = v.parse::<f64>().ok();
+        }
+    }
+
+    if let Some(c) = edge_count {
+        println!("║  Edge Packets:      {:>10}                                  ║", c);
+    }
+    if let Some(t) = edge_time {
+        println!("║  Edge Work Time:    {:>10.2} ms                              ║", t);
+    }
+
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    if let Some(tt) = total_time {
+        println!("║  {}                                        ║", tt.trim());
+    }
+    println!("╚══════════════════════════════════════════════════════════════════╝");
 }
 
 /// Load stackmaps from compiled code
@@ -1187,56 +1504,58 @@ pub fn alloc(size: usize) -> Address {
 }
 
 /// Allocate a cons cell
+#[inline(always)]
 pub fn alloc_cons(car: TaggedValue, cdr: TaggedValue) -> TaggedValue {
-    let size = std::mem::size_of::<ConsCell>();
-    let ptr = alloc(size);
-
-    // Set header
-    let header_addr = ptr - HEAP_HEADER_SIZE;
-    let header = unsafe { &mut *(header_addr.to_mut_ptr::<HeapObjectHeader>()) };
-    header.forwarding = std::ptr::null_mut();
-    header.size = size as u32;
-    header.magic = HEAP_MAGIC;
-    header.obj_type = HeapObjectType::Cons;
-    header.ptr_count = 2;
-    header.flags = 0;
-
-    // Initialize cons cell
-    let cons = unsafe { &mut *(ptr.to_mut_ptr::<ConsCell>()) };
-    cons.car = car;
-    cons.cdr = cdr;
-
-    // Post-alloc hook for MMTk - required for proper allocation tracking
-    let obj_ref = unsafe { ObjectReference::from_raw_address_unchecked(ptr) };
     MUTATOR.with(|m| {
         let mptr = m.get().expect("Mutator not bound");
         let mutator = unsafe { &mut *mptr };
+
+        const SIZE: usize = std::mem::size_of::<ConsCell>();
+        const TOTAL_SIZE: usize = HEAP_HEADER_SIZE + SIZE;
+        const ALIGNED_SIZE: usize = (TOTAL_SIZE + 7) & !7;
+
+        let header_addr = mmtk::memory_manager::alloc::<StatepointVM>(
+            mutator,
+            ALIGNED_SIZE,
+            8,
+            0,
+            AllocationSemantics::Default,
+        );
+
+        // Set header
+        let header = unsafe { &mut *(header_addr.to_mut_ptr::<HeapObjectHeader>()) };
+        header.forwarding = std::ptr::null_mut();
+        header.size = SIZE as u32;
+        header.magic = HEAP_MAGIC;
+        header.obj_type = HeapObjectType::Cons;
+        header.ptr_count = 2;
+        header.flags = 0;
+
+        // Initialize cons cell
+        let ptr = header_addr + HEAP_HEADER_SIZE;
+        let cons = unsafe { &mut *(ptr.to_mut_ptr::<ConsCell>()) };
+        cons.car = car;
+        cons.cdr = cdr;
+
+        // Post-alloc hook for MMTk
+        let obj_ref = unsafe { ObjectReference::from_raw_address_unchecked(ptr) };
         mmtk::memory_manager::post_alloc::<StatepointVM>(
             mutator,
             obj_ref,
-            HEAP_HEADER_SIZE + size,
+            ALIGNED_SIZE,
             AllocationSemantics::Default,
         );
-    });
 
-    ptr.as_usize() as TaggedValue
+        ptr.as_usize() as TaggedValue
+    })
 }
 
 /// Trigger GC with current frame info
 pub fn trigger_gc(fp: *const u8, _sp: *const u8, return_addr: usize) {
     let jit_sp = _sp;
 
-    // Set current frame for root scanning
-    {
-        let mut state = STATEPOINT_STATE.lock().unwrap();
-        if let Some(ref mut s) = *state {
-            s.current_frame = Some(FrameInfo {
-                fp,
-                sp: jit_sp,
-                return_addr,
-            });
-        }
-    }
+    // Set current frame for root scanning (using atomics - fast!)
+    set_frame_atomics(fp, jit_sp, return_addr, None);
 
     // Trigger GC with force=true to ensure it actually runs
     let tls = VMMutatorThread(VMThread::UNINITIALIZED);
@@ -1332,49 +1651,122 @@ pub unsafe extern "C" fn rt_cons_raw_mmtk(_car: TaggedValue, _cdr: TaggedValue) 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn rt_cons_raw_mmtk_impl(
-    car: TaggedValue,
-    cdr: TaggedValue,
+    _car: TaggedValue,  // Don't use these directly - they may be stale after GC
+    _cdr: TaggedValue,
     fp: *const u8,
     sp: *const u8,
     ra: usize,
     regs: *mut usize,
 ) -> *mut u8 {
-    static ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count < 5 {
-        gc_log!("ALLOC #{}: cons({:#x}, {:#x})", count, car, cdr);
-        if count < 3 {
-            let saved_fp = unsafe { std::ptr::read_unaligned(fp as *const usize) };
-            let saved_ra_at_saved_fp =
-                unsafe { std::ptr::read_unaligned((saved_fp + 8) as *const usize) };
-            gc_log!("rt_cons frame: fp={:#x} sp={:#x} ra={:#x}", fp as usize, sp as usize, ra);
-            gc_log!("  saved_fp={:#x} (gap={} bytes)", saved_fp, saved_fp.saturating_sub(fp as usize));
-            gc_log!("  [saved_fp+8]={:#x} (is this JIT addr?)", saved_ra_at_saved_fp);
-        }
-    }
+    // Set current frame for GC root scanning (using atomics - fast!)
+    set_frame_atomics(fp, sp, ra, Some(regs as usize));
 
-    {
-        let mut state = STATEPOINT_STATE.lock().unwrap();
-        if let Some(ref mut s) = *state {
-            s.current_frame = Some(FrameInfo { fp, sp, return_addr: ra });
-            s.current_regs = Some(regs as usize);
-        }
-    }
+    // Allocate cons cell - GC may run during this, updating regs[0] and regs[1]
+    // We read car/cdr from regs AFTER allocation since GC may have updated them
+    MUTATOR.with(|m| {
+        let mptr = m.get().expect("Mutator not bound");
+        let mutator = unsafe { &mut *mptr };
 
-    let result = alloc_cons(car, cdr);
+        const SIZE: usize = std::mem::size_of::<ConsCell>();
+        const TOTAL_SIZE: usize = HEAP_HEADER_SIZE + SIZE;
+        const ALIGNED_SIZE: usize = (TOTAL_SIZE + 7) & !7;
 
-    result as *mut u8
+        let header_addr = mmtk::memory_manager::alloc::<StatepointVM>(
+            mutator,
+            ALIGNED_SIZE,
+            8,
+            0,
+            AllocationSemantics::Default,
+        );
+
+        // Re-read car/cdr from regs AFTER allocation (GC may have updated them)
+        let car = unsafe { *regs } as TaggedValue;
+        let cdr = unsafe { *regs.add(1) } as TaggedValue;
+
+        // Set header
+        let header = unsafe { &mut *(header_addr.to_mut_ptr::<HeapObjectHeader>()) };
+        header.forwarding = std::ptr::null_mut();
+        header.size = SIZE as u32;
+        header.magic = HEAP_MAGIC;
+        header.obj_type = HeapObjectType::Cons;
+        header.ptr_count = 2;
+        header.flags = 0;
+
+        // Initialize cons cell with the potentially-updated values
+        let ptr = header_addr + HEAP_HEADER_SIZE;
+        let cons = unsafe { &mut *(ptr.to_mut_ptr::<ConsCell>()) };
+        cons.car = car;
+        cons.cdr = cdr;
+
+        // Post-alloc hook for MMTk
+        let obj_ref = unsafe { ObjectReference::from_raw_address_unchecked(ptr) };
+        mmtk::memory_manager::post_alloc::<StatepointVM>(
+            mutator,
+            obj_ref,
+            ALIGNED_SIZE,
+            AllocationSemantics::Default,
+        );
+
+        ptr.as_usize() as *mut u8
+    })
+}
+
+/// Allocate a cons cell, reading car/cdr from saved registers
+/// This allows GC to update the register values if objects move
+#[inline(always)]
+fn alloc_cons_from_regs(regs: *mut usize) -> TaggedValue {
+    MUTATOR.with(|m| {
+        let mptr = m.get().expect("Mutator not bound");
+        let mutator = unsafe { &mut *mptr };
+
+        const SIZE: usize = std::mem::size_of::<ConsCell>();
+        const TOTAL_SIZE: usize = HEAP_HEADER_SIZE + SIZE;
+        const ALIGNED_SIZE: usize = (TOTAL_SIZE + 7) & !7;
+
+        let header_addr = mmtk::memory_manager::alloc::<StatepointVM>(
+            mutator,
+            ALIGNED_SIZE,
+            8,
+            0,
+            AllocationSemantics::Default,
+        );
+
+        // Set header
+        let header = unsafe { &mut *(header_addr.to_mut_ptr::<HeapObjectHeader>()) };
+        header.forwarding = std::ptr::null_mut();
+        header.size = SIZE as u32;
+        header.magic = HEAP_MAGIC;
+        header.obj_type = HeapObjectType::Cons;
+        header.ptr_count = 2;
+        header.flags = 0;
+
+        // Read car/cdr from saved regs AFTER allocation (GC may have updated them)
+        let car = unsafe { *regs.add(0) } as TaggedValue;
+        let cdr = unsafe { *regs.add(1) } as TaggedValue;
+
+        // Initialize cons cell
+        let ptr = header_addr + HEAP_HEADER_SIZE;
+        let cons = unsafe { &mut *(ptr.to_mut_ptr::<ConsCell>()) };
+        cons.car = car;
+        cons.cdr = cdr;
+
+        // Post-alloc hook for MMTk
+        let obj_ref = unsafe { ObjectReference::from_raw_address_unchecked(ptr) };
+        mmtk::memory_manager::post_alloc::<StatepointVM>(
+            mutator,
+            obj_ref,
+            ALIGNED_SIZE,
+            AllocationSemantics::Default,
+        );
+
+        ptr.as_usize() as TaggedValue
+    })
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn rt_cons_raw_mmtk(car: TaggedValue, cdr: TaggedValue) -> *mut u8 {
-    static ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count < 5 {
-        gc_log!("ALLOC #{}: cons({:#x}, {:#x})", count, car, cdr);
-    }
     #[cfg(target_arch = "x86_64")]
     let (fp, sp, ra) = unsafe {
         let fp: usize;
@@ -1392,17 +1784,10 @@ pub extern "C" fn rt_cons_raw_mmtk(car: TaggedValue, cdr: TaggedValue) -> *mut u
     #[cfg(not(target_arch = "x86_64"))]
     let (fp, sp, ra) = (std::ptr::null(), std::ptr::null(), 0usize);
 
-    {
-        let mut state = STATEPOINT_STATE.lock().unwrap();
-        if let Some(ref mut s) = *state {
-            s.current_frame = Some(FrameInfo { fp, sp, return_addr: ra });
-            s.current_regs = None;
-        }
-    }
+    // Set current frame for GC root scanning (using atomics - fast!)
+    set_frame_atomics(fp, sp, ra, None);
 
-    let result = alloc_cons(car, cdr);
-
-    result as *mut u8
+    alloc_cons(car, cdr) as *mut u8
 }
 
 /// Runtime: Trigger GC
@@ -1476,13 +1861,24 @@ pub unsafe extern "C" fn rt_gc_mmtk() {
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn rt_gc_mmtk_impl(fp: *const u8, sp: *const u8, ra: usize, regs: *mut usize) {
-    {
-        let mut state = STATEPOINT_STATE.lock().unwrap();
-        if let Some(ref mut s) = *state {
-            s.current_regs = Some(regs as usize);
-        }
+    // Set current frame with regs (using atomics - fast!)
+    set_frame_atomics(fp, sp, ra, Some(regs as usize));
+
+    // Trigger GC
+    let tls = VMMutatorThread(VMThread::UNINITIALIZED);
+    let (gc_id, start) = if gc_timing_enabled() {
+        let id = GC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let start = Instant::now();
+        eprintln!("GC START {}", id);
+        (Some(id), Some(start))
+    } else {
+        (None, None)
+    };
+    mmtk().handle_user_collection_request(tls, true, false);
+    if let (Some(id), Some(start)) = (gc_id, start) {
+        let elapsed = start.elapsed().as_millis();
+        eprintln!("GC END {} ({} ms)", id, elapsed);
     }
-    trigger_gc(fp, sp, ra);
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -1509,24 +1905,85 @@ pub extern "C" fn rt_gc_mmtk() {
     trigger_gc(fp, sp, ra);
 }
 
+/// Safepoint-based cons allocation for MMTk
+/// Called from JIT code at safepoint with frame info from LLVM intrinsics
+/// This replaces the naked assembly approach with proper statepoint usage
+///
+/// car_slot/cdr_slot are pointers to stack slots containing car/cdr values.
+/// GC will update these slots if objects move, so we read from them AFTER allocation.
+#[no_mangle]
+pub extern "C" fn rt_cons_raw_mmtk_safepoint(
+    car_slot: *mut TaggedValue,
+    cdr_slot: *mut TaggedValue,
+    fp: usize,
+    sp: usize,
+    ra: usize,
+) -> *mut u8 {
+    // Store frame info for GC to use during stack walking
+    set_frame_atomics(fp as *const u8, sp as *const u8, ra, None);
+
+    // Allocate cons cell - GC may run during this
+    // GC will use the stackmap to find roots and update car_slot/cdr_slot if objects move
+    MUTATOR.with(|m| {
+        let mptr = m.get().expect("Mutator not bound");
+        let mutator = unsafe { &mut *mptr };
+
+        const SIZE: usize = std::mem::size_of::<ConsCell>();
+        const TOTAL_SIZE: usize = HEAP_HEADER_SIZE + SIZE;
+        const ALIGNED_SIZE: usize = (TOTAL_SIZE + 7) & !7;
+
+        let header_addr = mmtk::memory_manager::alloc::<StatepointVM>(
+            mutator,
+            ALIGNED_SIZE,
+            8,
+            0,
+            AllocationSemantics::Default,
+        );
+
+        // Read car/cdr from slots AFTER allocation (GC may have updated them)
+        let car = unsafe { *car_slot };
+        let cdr = unsafe { *cdr_slot };
+
+        // Set header
+        let header = unsafe { &mut *(header_addr.to_mut_ptr::<HeapObjectHeader>()) };
+        header.forwarding = std::ptr::null_mut();
+        header.size = SIZE as u32;
+        header.magic = HEAP_MAGIC;
+        header.obj_type = HeapObjectType::Cons;
+        header.ptr_count = 2;
+        header.flags = 0;
+
+        // Initialize cons cell with potentially-updated values
+        let ptr = header_addr + HEAP_HEADER_SIZE;
+        let cons = unsafe { &mut *(ptr.to_mut_ptr::<ConsCell>()) };
+        cons.car = car;
+        cons.cdr = cdr;
+
+        // Post-alloc hook for MMTk
+        let obj_ref = unsafe { ObjectReference::from_raw_address_unchecked(ptr) };
+        mmtk::memory_manager::post_alloc::<StatepointVM>(
+            mutator,
+            obj_ref,
+            ALIGNED_SIZE,
+            AllocationSemantics::Default,
+        );
+
+        ptr.as_usize() as *mut u8
+    })
+}
+
 /// Runtime car - extract first element of cons cell
 #[no_mangle]
+#[inline(always)]
 pub extern "C" fn rt_car(cell: TaggedValue) -> TaggedValue {
-    if !crate::tagged_value::is_pointer(cell) {
-        gc_log!("rt_car: non-pointer value {:#x}", cell);
-        return crate::tagged_value::NIL;
-    }
     let ptr = cell as usize as *const ConsCell;
     unsafe { (*ptr).car }
 }
 
 /// Runtime cdr - extract rest of cons cell
 #[no_mangle]
+#[inline(always)]
 pub extern "C" fn rt_cdr(cell: TaggedValue) -> TaggedValue {
-    if !crate::tagged_value::is_pointer(cell) {
-        gc_log!("rt_cdr: non-pointer value {:#x}", cell);
-        return crate::tagged_value::NIL;
-    }
     let ptr = cell as usize as *const ConsCell;
     unsafe { (*ptr).cdr }
 }
@@ -1651,6 +2108,7 @@ pub extern "C" fn rt_max(a: TaggedValue, b: TaggedValue) -> TaggedValue {
 /// Runtime symbols struct
 pub struct RuntimeSymbols {
     pub cons: usize,
+    pub cons_safepoint: usize,  // New safepoint-based cons
     pub gc: usize,
     pub car: usize,
     pub cdr: usize,
@@ -1669,6 +2127,7 @@ pub struct RuntimeSymbols {
 pub fn get_all_runtime_symbols() -> RuntimeSymbols {
     RuntimeSymbols {
         cons: rt_cons_raw_mmtk as *const () as usize,
+        cons_safepoint: rt_cons_raw_mmtk_safepoint as *const () as usize,
         gc: rt_gc_mmtk as *const () as usize,
         car: rt_car as *const () as usize,
         cdr: rt_cdr as *const () as usize,

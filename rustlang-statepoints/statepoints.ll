@@ -29,6 +29,11 @@ declare i64 @rt_max(i64, i64)
 
 define i64 @main() #0 gc "statepoint-example" {
 entry:
+  %iterations = alloca ptr addrspace(1), align 8
+  %depth = alloca ptr addrspace(1), align 8
+  %longLivedTree = alloca ptr addrspace(1), align 8
+  %stretchDepth = alloca ptr addrspace(1), align 8
+  %maxDepth = alloca ptr addrspace(1), align 8
   %statepoint_token = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @rt_get_arg, i32 1, i32 0, i64 9, i32 0, i32 0)
   %get_arg77 = call i64 @llvm.experimental.gc.result.i64(token %statepoint_token)
   %to_gcptr = inttoptr i64 %get_arg77 to ptr addrspace(1)
@@ -36,14 +41,12 @@ entry:
   %statepoint_token78 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64, i64)) @rt_max, i32 2, i32 0, i64 49, i64 %to_i64, i32 0, i32 0)
   %max79 = call i64 @llvm.experimental.gc.result.i64(token %statepoint_token78)
   %to_gcptr1 = inttoptr i64 %max79 to ptr addrspace(1)
-  %maxDepth = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) %to_gcptr1, ptr %maxDepth, align 8
   %maxDepth2 = load ptr addrspace(1), ptr %maxDepth, align 8
   %to_i643 = ptrtoint ptr addrspace(1) %maxDepth2 to i64
   %sum = add i64 %to_i643, 9
   %fixnum_add = sub i64 %sum, 1
   %to_gcptr4 = inttoptr i64 %fixnum_add to ptr addrspace(1)
-  %stretchDepth = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) %to_gcptr4, ptr %stretchDepth, align 8
   %stretchDepth5 = load ptr addrspace(1), ptr %stretchDepth, align 8
   %to_i646 = ptrtoint ptr addrspace(1) %stretchDepth5 to i64
@@ -87,7 +90,6 @@ entry:
   store ptr addrspace(1) %maxDepth_live20.relocated, ptr %maxDepth, align 8
   store ptr addrspace(1) %stretchDepth_live21.relocated, ptr %stretchDepth, align 8
   %to_gcptr23 = inttoptr i64 %call2286 to ptr addrspace(1)
-  %longLivedTree = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) %to_gcptr23, ptr %longLivedTree, align 8
   %longLivedTree24 = load ptr addrspace(1), ptr %longLivedTree, align 8
   %to_i6425 = ptrtoint ptr addrspace(1) %longLivedTree24 to i64
@@ -101,7 +103,6 @@ entry:
   store ptr addrspace(1) %maxDepth_live26.relocated, ptr %maxDepth, align 8
   store ptr addrspace(1) %stretchDepth_live27.relocated, ptr %stretchDepth, align 8
   store ptr addrspace(1) %longLivedTree_live.relocated, ptr %longLivedTree, align 8
-  %depth = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) inttoptr (i64 33 to ptr addrspace(1)), ptr %depth, align 8
   br label %whilecond
 
@@ -134,7 +135,6 @@ whilebody:                                        ; preds = %whilecond
   %result_shift = shl i64 %shl, 3
   %fixnum_shl = or i64 %result_shift, 1
   %to_gcptr44 = inttoptr i64 %fixnum_shl to ptr addrspace(1)
-  %iterations = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) %to_gcptr44, ptr %iterations, align 8
   %iterations45 = load ptr addrspace(1), ptr %iterations, align 8
   %to_i6446 = ptrtoint ptr addrspace(1) %iterations45 to i64
@@ -142,22 +142,22 @@ whilebody:                                        ; preds = %whilecond
   %to_i6448 = ptrtoint ptr addrspace(1) %depth47 to i64
   %longLivedTree49 = load ptr addrspace(1), ptr %longLivedTree, align 8
   %to_i6450 = ptrtoint ptr addrspace(1) %longLivedTree49 to i64
-  %longLivedTree_live51 = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %maxDepth_live52 = load ptr addrspace(1), ptr %maxDepth, align 8
-  %stretchDepth_live53 = load ptr addrspace(1), ptr %stretchDepth, align 8
   %depth_live = load ptr addrspace(1), ptr %depth, align 8
+  %stretchDepth_live51 = load ptr addrspace(1), ptr %stretchDepth, align 8
+  %longLivedTree_live52 = load ptr addrspace(1), ptr %longLivedTree, align 8
+  %maxDepth_live53 = load ptr addrspace(1), ptr %maxDepth, align 8
   %iterations_live = load ptr addrspace(1), ptr %iterations, align 8
-  %statepoint_token88 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64, i64, i64)) @work, i32 3, i32 0, i64 %to_i6446, i64 %to_i6448, i64 %to_i6450, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %iterations_live, ptr addrspace(1) %depth_live, ptr addrspace(1) %stretchDepth_live53, ptr addrspace(1) %maxDepth_live52, ptr addrspace(1) %longLivedTree_live51) ]
+  %statepoint_token88 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64, i64, i64)) @work, i32 3, i32 0, i64 %to_i6446, i64 %to_i6448, i64 %to_i6450, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %iterations_live, ptr addrspace(1) %maxDepth_live53, ptr addrspace(1) %longLivedTree_live52, ptr addrspace(1) %stretchDepth_live51, ptr addrspace(1) %depth_live) ]
   %call5489 = call i64 @llvm.experimental.gc.result.i64(token %statepoint_token88)
   %iterations_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 0, i32 0) ; (%iterations_live, %iterations_live)
-  %depth_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 1, i32 1) ; (%depth_live, %depth_live)
-  %stretchDepth_live53.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 2, i32 2) ; (%stretchDepth_live53, %stretchDepth_live53)
-  %maxDepth_live52.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 3, i32 3) ; (%maxDepth_live52, %maxDepth_live52)
-  %longLivedTree_live51.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 4, i32 4) ; (%longLivedTree_live51, %longLivedTree_live51)
-  store ptr addrspace(1) %longLivedTree_live51.relocated, ptr %longLivedTree, align 8
-  store ptr addrspace(1) %maxDepth_live52.relocated, ptr %maxDepth, align 8
-  store ptr addrspace(1) %stretchDepth_live53.relocated, ptr %stretchDepth, align 8
+  %maxDepth_live53.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 1, i32 1) ; (%maxDepth_live53, %maxDepth_live53)
+  %longLivedTree_live52.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 2, i32 2) ; (%longLivedTree_live52, %longLivedTree_live52)
+  %stretchDepth_live51.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 3, i32 3) ; (%stretchDepth_live51, %stretchDepth_live51)
+  %depth_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token88, i32 4, i32 4) ; (%depth_live, %depth_live)
   store ptr addrspace(1) %depth_live.relocated, ptr %depth, align 8
+  store ptr addrspace(1) %stretchDepth_live51.relocated, ptr %stretchDepth, align 8
+  store ptr addrspace(1) %longLivedTree_live52.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %maxDepth_live53.relocated, ptr %maxDepth, align 8
   store ptr addrspace(1) %iterations_live.relocated, ptr %iterations, align 8
   %to_gcptr55 = inttoptr i64 %call5489 to ptr addrspace(1)
   %depth56 = load ptr addrspace(1), ptr %depth, align 8
@@ -173,39 +173,39 @@ whileend:                                         ; preds = %whilecond
   %to_i6462 = ptrtoint ptr addrspace(1) %maxDepth61 to i64
   %longLivedTree63 = load ptr addrspace(1), ptr %longLivedTree, align 8
   %to_i6464 = ptrtoint ptr addrspace(1) %longLivedTree63 to i64
-  %longLivedTree_live65 = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %maxDepth_live66 = load ptr addrspace(1), ptr %maxDepth, align 8
-  %stretchDepth_live67 = load ptr addrspace(1), ptr %stretchDepth, align 8
-  %statepoint_token90 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @item_check, i32 1, i32 0, i64 %to_i6464, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %stretchDepth_live67, ptr addrspace(1) %maxDepth_live66, ptr addrspace(1) %longLivedTree_live65) ]
+  %stretchDepth_live65 = load ptr addrspace(1), ptr %stretchDepth, align 8
+  %longLivedTree_live66 = load ptr addrspace(1), ptr %longLivedTree, align 8
+  %maxDepth_live67 = load ptr addrspace(1), ptr %maxDepth, align 8
+  %statepoint_token90 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @item_check, i32 1, i32 0, i64 %to_i6464, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %maxDepth_live67, ptr addrspace(1) %longLivedTree_live66, ptr addrspace(1) %stretchDepth_live65) ]
   %call6891 = call i64 @llvm.experimental.gc.result.i64(token %statepoint_token90)
-  %stretchDepth_live67.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token90, i32 0, i32 0) ; (%stretchDepth_live67, %stretchDepth_live67)
-  %maxDepth_live66.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token90, i32 1, i32 1) ; (%maxDepth_live66, %maxDepth_live66)
-  %longLivedTree_live65.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token90, i32 2, i32 2) ; (%longLivedTree_live65, %longLivedTree_live65)
-  store ptr addrspace(1) %longLivedTree_live65.relocated, ptr %longLivedTree, align 8
-  store ptr addrspace(1) %maxDepth_live66.relocated, ptr %maxDepth, align 8
-  store ptr addrspace(1) %stretchDepth_live67.relocated, ptr %stretchDepth, align 8
+  %maxDepth_live67.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token90, i32 0, i32 0) ; (%maxDepth_live67, %maxDepth_live67)
+  %longLivedTree_live66.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token90, i32 1, i32 1) ; (%longLivedTree_live66, %longLivedTree_live66)
+  %stretchDepth_live65.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token90, i32 2, i32 2) ; (%stretchDepth_live65, %stretchDepth_live65)
+  store ptr addrspace(1) %stretchDepth_live65.relocated, ptr %stretchDepth, align 8
+  store ptr addrspace(1) %longLivedTree_live66.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %maxDepth_live67.relocated, ptr %maxDepth, align 8
   %to_gcptr69 = inttoptr i64 %call6891 to ptr addrspace(1)
   %to_i6470 = ptrtoint ptr addrspace(1) %to_gcptr69 to i64
-  %longLivedTree_live71 = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %maxDepth_live72 = load ptr addrspace(1), ptr %maxDepth, align 8
-  %stretchDepth_live73 = load ptr addrspace(1), ptr %stretchDepth, align 8
-  %statepoint_token92 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void (i64, i64)) @rt_print_long_lived_check, i32 2, i32 0, i64 %to_i6462, i64 %to_i6470, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %stretchDepth_live73, ptr addrspace(1) %maxDepth_live72, ptr addrspace(1) %longLivedTree_live71) ]
-  %stretchDepth_live73.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token92, i32 0, i32 0) ; (%stretchDepth_live73, %stretchDepth_live73)
-  %maxDepth_live72.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token92, i32 1, i32 1) ; (%maxDepth_live72, %maxDepth_live72)
-  %longLivedTree_live71.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token92, i32 2, i32 2) ; (%longLivedTree_live71, %longLivedTree_live71)
-  store ptr addrspace(1) %longLivedTree_live71.relocated, ptr %longLivedTree, align 8
-  store ptr addrspace(1) %maxDepth_live72.relocated, ptr %maxDepth, align 8
-  store ptr addrspace(1) %stretchDepth_live73.relocated, ptr %stretchDepth, align 8
-  %longLivedTree_live74 = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %maxDepth_live75 = load ptr addrspace(1), ptr %maxDepth, align 8
-  %stretchDepth_live76 = load ptr addrspace(1), ptr %stretchDepth, align 8
-  %statepoint_token93 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void ()) @rt_clear_global_root, i32 0, i32 0, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %stretchDepth_live76, ptr addrspace(1) %maxDepth_live75, ptr addrspace(1) %longLivedTree_live74) ]
-  %stretchDepth_live76.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token93, i32 0, i32 0) ; (%stretchDepth_live76, %stretchDepth_live76)
-  %maxDepth_live75.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token93, i32 1, i32 1) ; (%maxDepth_live75, %maxDepth_live75)
-  %longLivedTree_live74.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token93, i32 2, i32 2) ; (%longLivedTree_live74, %longLivedTree_live74)
-  store ptr addrspace(1) %longLivedTree_live74.relocated, ptr %longLivedTree, align 8
-  store ptr addrspace(1) %maxDepth_live75.relocated, ptr %maxDepth, align 8
-  store ptr addrspace(1) %stretchDepth_live76.relocated, ptr %stretchDepth, align 8
+  %stretchDepth_live71 = load ptr addrspace(1), ptr %stretchDepth, align 8
+  %longLivedTree_live72 = load ptr addrspace(1), ptr %longLivedTree, align 8
+  %maxDepth_live73 = load ptr addrspace(1), ptr %maxDepth, align 8
+  %statepoint_token92 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void (i64, i64)) @rt_print_long_lived_check, i32 2, i32 0, i64 %to_i6462, i64 %to_i6470, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %maxDepth_live73, ptr addrspace(1) %longLivedTree_live72, ptr addrspace(1) %stretchDepth_live71) ]
+  %maxDepth_live73.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token92, i32 0, i32 0) ; (%maxDepth_live73, %maxDepth_live73)
+  %longLivedTree_live72.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token92, i32 1, i32 1) ; (%longLivedTree_live72, %longLivedTree_live72)
+  %stretchDepth_live71.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token92, i32 2, i32 2) ; (%stretchDepth_live71, %stretchDepth_live71)
+  store ptr addrspace(1) %stretchDepth_live71.relocated, ptr %stretchDepth, align 8
+  store ptr addrspace(1) %longLivedTree_live72.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %maxDepth_live73.relocated, ptr %maxDepth, align 8
+  %stretchDepth_live74 = load ptr addrspace(1), ptr %stretchDepth, align 8
+  %longLivedTree_live75 = load ptr addrspace(1), ptr %longLivedTree, align 8
+  %maxDepth_live76 = load ptr addrspace(1), ptr %maxDepth, align 8
+  %statepoint_token93 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void ()) @rt_clear_global_root, i32 0, i32 0, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %maxDepth_live76, ptr addrspace(1) %longLivedTree_live75, ptr addrspace(1) %stretchDepth_live74) ]
+  %maxDepth_live76.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token93, i32 0, i32 0) ; (%maxDepth_live76, %maxDepth_live76)
+  %longLivedTree_live75.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token93, i32 1, i32 1) ; (%longLivedTree_live75, %longLivedTree_live75)
+  %stretchDepth_live74.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token93, i32 2, i32 2) ; (%stretchDepth_live74, %stretchDepth_live74)
+  store ptr addrspace(1) %stretchDepth_live74.relocated, ptr %stretchDepth, align 8
+  store ptr addrspace(1) %longLivedTree_live75.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %maxDepth_live76.relocated, ptr %maxDepth, align 8
   ret i64 3
 }
 
@@ -341,6 +341,8 @@ ifcont:                                           ; preds = %else, %then
 
 define i64 @work(i64 %0, i64 %1, i64 %2) #0 gc "statepoint-example" {
 entry:
+  %i = alloca ptr addrspace(1), align 8
+  %check = alloca ptr addrspace(1), align 8
   %to_gcptr = inttoptr i64 %0 to ptr addrspace(1)
   %iterations = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) %to_gcptr, ptr %iterations, align 8
@@ -350,9 +352,7 @@ entry:
   %to_gcptr2 = inttoptr i64 %2 to ptr addrspace(1)
   %longLivedTree = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) %to_gcptr2, ptr %longLivedTree, align 8
-  %check = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) inttoptr (i64 1 to ptr addrspace(1)), ptr %check, align 8
-  %i = alloca ptr addrspace(1), align 8
   store ptr addrspace(1) inttoptr (i64 1 to ptr addrspace(1)), ptr %i, align 8
   br label %whilecond
 
@@ -374,40 +374,40 @@ whilebody:                                        ; preds = %whilecond
   %to_i6411 = ptrtoint ptr addrspace(1) %depth10 to i64
   %check_live = load ptr addrspace(1), ptr %check, align 8
   %i_live = load ptr addrspace(1), ptr %i, align 8
+  %longLivedTree_live = load ptr addrspace(1), ptr %longLivedTree, align 8
   %iterations_live = load ptr addrspace(1), ptr %iterations, align 8
   %depth_live = load ptr addrspace(1), ptr %depth, align 8
-  %longLivedTree_live = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %statepoint_token = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @bottom_up_tree, i32 1, i32 0, i64 %to_i6411, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %longLivedTree_live, ptr addrspace(1) %depth_live, ptr addrspace(1) %iterations_live, ptr addrspace(1) %i_live, ptr addrspace(1) %check_live) ]
+  %statepoint_token = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @bottom_up_tree, i32 1, i32 0, i64 %to_i6411, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %depth_live, ptr addrspace(1) %iterations_live, ptr addrspace(1) %longLivedTree_live, ptr addrspace(1) %i_live, ptr addrspace(1) %check_live) ]
   %call39 = call i64 @llvm.experimental.gc.result.i64(token %statepoint_token)
-  %longLivedTree_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 0, i32 0) ; (%longLivedTree_live, %longLivedTree_live)
-  %depth_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 1, i32 1) ; (%depth_live, %depth_live)
-  %iterations_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 2, i32 2) ; (%iterations_live, %iterations_live)
+  %depth_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 0, i32 0) ; (%depth_live, %depth_live)
+  %iterations_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 1, i32 1) ; (%iterations_live, %iterations_live)
+  %longLivedTree_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 2, i32 2) ; (%longLivedTree_live, %longLivedTree_live)
   %i_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 3, i32 3) ; (%i_live, %i_live)
   %check_live.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token, i32 4, i32 4) ; (%check_live, %check_live)
   store ptr addrspace(1) %check_live.relocated, ptr %check, align 8
   store ptr addrspace(1) %i_live.relocated, ptr %i, align 8
+  store ptr addrspace(1) %longLivedTree_live.relocated, ptr %longLivedTree, align 8
   store ptr addrspace(1) %iterations_live.relocated, ptr %iterations, align 8
   store ptr addrspace(1) %depth_live.relocated, ptr %depth, align 8
-  store ptr addrspace(1) %longLivedTree_live.relocated, ptr %longLivedTree, align 8
   %to_gcptr12 = inttoptr i64 %call39 to ptr addrspace(1)
   %to_i6413 = ptrtoint ptr addrspace(1) %to_gcptr12 to i64
   %check_live14 = load ptr addrspace(1), ptr %check, align 8
   %i_live15 = load ptr addrspace(1), ptr %i, align 8
-  %iterations_live16 = load ptr addrspace(1), ptr %iterations, align 8
-  %depth_live17 = load ptr addrspace(1), ptr %depth, align 8
-  %longLivedTree_live18 = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %statepoint_token40 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @item_check, i32 1, i32 0, i64 %to_i6413, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %longLivedTree_live18, ptr addrspace(1) %depth_live17, ptr addrspace(1) %iterations_live16, ptr addrspace(1) %i_live15, ptr addrspace(1) %check_live14) ]
+  %longLivedTree_live16 = load ptr addrspace(1), ptr %longLivedTree, align 8
+  %iterations_live17 = load ptr addrspace(1), ptr %iterations, align 8
+  %depth_live18 = load ptr addrspace(1), ptr %depth, align 8
+  %statepoint_token40 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(i64 (i64)) @item_check, i32 1, i32 0, i64 %to_i6413, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %depth_live18, ptr addrspace(1) %iterations_live17, ptr addrspace(1) %longLivedTree_live16, ptr addrspace(1) %i_live15, ptr addrspace(1) %check_live14) ]
   %call1941 = call i64 @llvm.experimental.gc.result.i64(token %statepoint_token40)
-  %longLivedTree_live18.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 0, i32 0) ; (%longLivedTree_live18, %longLivedTree_live18)
-  %depth_live17.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 1, i32 1) ; (%depth_live17, %depth_live17)
-  %iterations_live16.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 2, i32 2) ; (%iterations_live16, %iterations_live16)
+  %depth_live18.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 0, i32 0) ; (%depth_live18, %depth_live18)
+  %iterations_live17.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 1, i32 1) ; (%iterations_live17, %iterations_live17)
+  %longLivedTree_live16.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 2, i32 2) ; (%longLivedTree_live16, %longLivedTree_live16)
   %i_live15.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 3, i32 3) ; (%i_live15, %i_live15)
   %check_live14.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token40, i32 4, i32 4) ; (%check_live14, %check_live14)
   store ptr addrspace(1) %check_live14.relocated, ptr %check, align 8
   store ptr addrspace(1) %i_live15.relocated, ptr %i, align 8
-  store ptr addrspace(1) %iterations_live16.relocated, ptr %iterations, align 8
-  store ptr addrspace(1) %depth_live17.relocated, ptr %depth, align 8
-  store ptr addrspace(1) %longLivedTree_live18.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %longLivedTree_live16.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %iterations_live17.relocated, ptr %iterations, align 8
+  store ptr addrspace(1) %depth_live18.relocated, ptr %depth, align 8
   %to_gcptr20 = inttoptr i64 %call1941 to ptr addrspace(1)
   %to_i6421 = ptrtoint ptr addrspace(1) %to_gcptr20 to i64
   %sum = add i64 %to_i649, %to_i6421
@@ -431,20 +431,20 @@ whileend:                                         ; preds = %whilecond
   %to_i6433 = ptrtoint ptr addrspace(1) %check32 to i64
   %check_live34 = load ptr addrspace(1), ptr %check, align 8
   %i_live35 = load ptr addrspace(1), ptr %i, align 8
-  %iterations_live36 = load ptr addrspace(1), ptr %iterations, align 8
-  %depth_live37 = load ptr addrspace(1), ptr %depth, align 8
-  %longLivedTree_live38 = load ptr addrspace(1), ptr %longLivedTree, align 8
-  %statepoint_token42 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void (i64, i64, i64)) @rt_print_trees_check, i32 3, i32 0, i64 %to_i6429, i64 %to_i6431, i64 %to_i6433, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %longLivedTree_live38, ptr addrspace(1) %depth_live37, ptr addrspace(1) %iterations_live36, ptr addrspace(1) %i_live35, ptr addrspace(1) %check_live34) ]
-  %longLivedTree_live38.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 0, i32 0) ; (%longLivedTree_live38, %longLivedTree_live38)
-  %depth_live37.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 1, i32 1) ; (%depth_live37, %depth_live37)
-  %iterations_live36.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 2, i32 2) ; (%iterations_live36, %iterations_live36)
+  %longLivedTree_live36 = load ptr addrspace(1), ptr %longLivedTree, align 8
+  %iterations_live37 = load ptr addrspace(1), ptr %iterations, align 8
+  %depth_live38 = load ptr addrspace(1), ptr %depth, align 8
+  %statepoint_token42 = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void (i64, i64, i64)) @rt_print_trees_check, i32 3, i32 0, i64 %to_i6429, i64 %to_i6431, i64 %to_i6433, i32 0, i32 0) [ "gc-live"(ptr addrspace(1) %depth_live38, ptr addrspace(1) %iterations_live37, ptr addrspace(1) %longLivedTree_live36, ptr addrspace(1) %i_live35, ptr addrspace(1) %check_live34) ]
+  %depth_live38.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 0, i32 0) ; (%depth_live38, %depth_live38)
+  %iterations_live37.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 1, i32 1) ; (%iterations_live37, %iterations_live37)
+  %longLivedTree_live36.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 2, i32 2) ; (%longLivedTree_live36, %longLivedTree_live36)
   %i_live35.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 3, i32 3) ; (%i_live35, %i_live35)
   %check_live34.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %statepoint_token42, i32 4, i32 4) ; (%check_live34, %check_live34)
   store ptr addrspace(1) %check_live34.relocated, ptr %check, align 8
   store ptr addrspace(1) %i_live35.relocated, ptr %i, align 8
-  store ptr addrspace(1) %iterations_live36.relocated, ptr %iterations, align 8
-  store ptr addrspace(1) %depth_live37.relocated, ptr %depth, align 8
-  store ptr addrspace(1) %longLivedTree_live38.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %longLivedTree_live36.relocated, ptr %longLivedTree, align 8
+  store ptr addrspace(1) %iterations_live37.relocated, ptr %iterations, align 8
+  store ptr addrspace(1) %depth_live38.relocated, ptr %depth, align 8
   ret i64 3
 }
 
