@@ -3,26 +3,28 @@
 //! This crate provides:
 //! - A lexer and parser for V8 Torque `.tq` files
 //! - AST types representing Torque programs
-//! - Trait-based code generation for targeting different backends
+//! - Trait-based code generation for targeting different backends (JVM, WASM, etc.)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use torque_rs::{parse_source, codegen::CodeGen};
+//! use torque_rs::{parse_source, CodeGenerator};
+//! use torque_rs::codegen::java_asm::JavaAsmBackend;
 //!
 //! let source = r#"
-//!     namespace math {
-//!         javascript builtin MathAbs(
-//!             context: Context, receiver: Object, x: Object): Number {
-//!             const num: Number = ToNumber(context, x);
-//!             return num < 0 ? -num : num;
+//!     namespace array {
+//!         javascript builtin ArrayPush(
+//!             context: Context, receiver: JSArray, ...args): Number {
+//!             return receiver.length;
 //!         }
 //!     }
 //! "#;
 //!
 //! let ast = parse_source(source)?;
-//! let mut gen = MyBackend::new();
+//! let backend = JavaAsmBackend::new("js.builtins");
+//! let mut gen = CodeGenerator::new(backend);
 //! let output = gen.generate(&ast)?;
+//! // output.classes contains Java source files that use ASM to emit bytecode
 //! ```
 
 pub mod ast;
@@ -31,7 +33,7 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::*;
-pub use codegen::{CodeGen, CodeGenError, CodeGenResult};
+pub use codegen::{Backend, CodeGenError, CodeGenResult, CodeGenerator, JvmType};
 
 use lexer::{lex, Token};
 use parser::parse;
@@ -86,12 +88,11 @@ impl std::error::Error for ParseError {}
 // Example: Debug Printer Backend
 // ============================================================================
 
-/// Example codegen backend that prints the AST structure
+/// Example: Debug printer that walks the AST
 pub mod examples {
     use super::*;
-    use codegen::*;
 
-    /// A simple backend that generates a debug representation
+    /// A simple AST printer for debugging
     pub struct DebugPrinter {
         output: String,
         indent: usize,
@@ -120,61 +121,32 @@ pub mod examples {
         fn leave(&mut self) {
             self.indent = self.indent.saturating_sub(1);
         }
-    }
 
-    impl Default for DebugPrinter {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl CodeGen for DebugPrinter {
-        type Output = String;
-        type TypeRepr = String;
-        type ExprResult = ();
-
-        fn generate(&mut self, file: &SourceFile) -> CodeGenResult<Self::Output> {
+        pub fn print(&mut self, file: &SourceFile) -> String {
             self.emit("SourceFile {");
             self.enter();
             for decl in &file.declarations {
-                self.visit_declaration(&decl.node)?;
+                self.print_declaration(&decl.node);
             }
             self.leave();
             self.emit("}");
-            Ok(std::mem::take(&mut self.output))
+            std::mem::take(&mut self.output)
         }
 
-        fn visit_declaration(&mut self, decl: &Declaration) -> CodeGenResult<()> {
+        fn print_declaration(&mut self, decl: &Declaration) {
             match decl {
                 Declaration::Namespace(ns) => {
                     self.emit(&format!("Namespace '{}' {{", ns.name.name));
                     self.enter();
                     for d in &ns.declarations {
-                        self.visit_declaration(&d.node)?;
+                        self.print_declaration(&d.node);
                     }
                     self.leave();
                     self.emit("}");
                 }
                 Declaration::Builtin(b) => {
                     let js = if b.is_javascript { "javascript " } else { "" };
-                    self.emit(&format!("{}builtin {}(", js, b.name.name));
-                    self.enter();
-                    for p in &b.params {
-                        self.emit(&format!("{}: {:?}", p.name.name, p.type_expr));
-                    }
-                    self.leave();
-                    if let Some(ret) = &b.return_type {
-                        self.emit(&format!("): {:?}", ret));
-                    }
-                    if let Some(body) = &b.body {
-                        self.emit("Body {");
-                        self.enter();
-                        for stmt in &body.statements {
-                            self.visit_statement(&stmt.node)?;
-                        }
-                        self.leave();
-                        self.emit("}");
-                    }
+                    self.emit(&format!("{}builtin {}(...)", js, b.name.name));
                 }
                 Declaration::Macro(m) => {
                     self.emit(&format!("macro {}(...)", m.name.name));
@@ -183,10 +155,10 @@ pub mod examples {
                     self.emit(&format!("type {} ...", t.name.name));
                 }
                 Declaration::Const(c) => {
-                    self.emit(&format!("const {}: {:?} = ...", c.name.name, c.type_expr));
+                    self.emit(&format!("const {} ...", c.name.name));
                 }
-                Declaration::Extern(e) => {
-                    self.emit(&format!("extern {:?}", e));
+                Declaration::Extern(_e) => {
+                    self.emit("extern ...");
                 }
                 Declaration::Class(c) => {
                     self.emit(&format!("class {} ...", c.name.name));
@@ -195,105 +167,12 @@ pub mod examples {
                     self.emit(&format!("struct {} ...", s.name.name));
                 }
             }
-            Ok(())
         }
+    }
 
-        fn visit_statement(&mut self, stmt: &Statement) -> CodeGenResult<()> {
-            match stmt {
-                Statement::Return(Some(e)) => {
-                    self.emit("return");
-                    self.enter();
-                    self.visit_expr(&e.node)?;
-                    self.leave();
-                }
-                Statement::Return(None) => {
-                    self.emit("return;");
-                }
-                Statement::VarDecl { is_const, name, type_expr, init } => {
-                    let kw = if *is_const { "const" } else { "let" };
-                    self.emit(&format!("{} {}: {:?} = ...", kw, name.name, type_expr));
-                }
-                Statement::If { condition, then_branch, else_branch } => {
-                    self.emit("if (...) {");
-                    self.enter();
-                    for s in &then_branch.statements {
-                        self.visit_statement(&s.node)?;
-                    }
-                    self.leave();
-                    if let Some(eb) = else_branch {
-                        self.emit("} else {");
-                        self.enter();
-                        for s in &eb.statements {
-                            self.visit_statement(&s.node)?;
-                        }
-                        self.leave();
-                    }
-                    self.emit("}");
-                }
-                Statement::Typeswitch { value, cases } => {
-                    self.emit("typeswitch (...) {");
-                    self.enter();
-                    for case in cases {
-                        self.emit(&format!("case ({}: {:?}):", case.binding.name, case.type_expr));
-                    }
-                    self.leave();
-                    self.emit("}");
-                }
-                Statement::Expr(e) => {
-                    self.visit_expr(&e.node)?;
-                    self.emit(";");
-                }
-                _ => {
-                    self.emit(&format!("{:?}", stmt));
-                }
-            }
-            Ok(())
-        }
-
-        fn visit_expr(&mut self, expr: &Expr) -> CodeGenResult<()> {
-            match expr {
-                Expr::Ident(id) => self.emit(&format!("Ident({})", id.name)),
-                Expr::IntLiteral(n) => self.emit(&format!("Int({})", n)),
-                Expr::FloatLiteral(n) => self.emit(&format!("Float({})", n)),
-                Expr::StringLiteral(s) => self.emit(&format!("String({:?})", s)),
-                Expr::BoolLiteral(b) => self.emit(&format!("Bool({})", b)),
-                Expr::Binary { op, left, right } => {
-                    self.emit(&format!("Binary({:?})", op));
-                    self.enter();
-                    self.visit_expr(&left.node)?;
-                    self.visit_expr(&right.node)?;
-                    self.leave();
-                }
-                Expr::Call { callee, args, .. } => {
-                    self.emit("Call");
-                    self.enter();
-                    self.visit_expr(&callee.node)?;
-                    for arg in args {
-                        self.visit_expr(&arg.node)?;
-                    }
-                    self.leave();
-                }
-                Expr::FieldAccess { object, field } => {
-                    self.emit(&format!("FieldAccess(.{})", field.name));
-                    self.enter();
-                    self.visit_expr(&object.node)?;
-                    self.leave();
-                }
-                Expr::Ternary { condition, then_expr, else_expr } => {
-                    self.emit("Ternary");
-                    self.enter();
-                    self.visit_expr(&condition.node)?;
-                    self.visit_expr(&then_expr.node)?;
-                    self.visit_expr(&else_expr.node)?;
-                    self.leave();
-                }
-                _ => self.emit(&format!("{:?}", expr)),
-            }
-            Ok(())
-        }
-
-        fn resolve_type(&mut self, ty: &TypeExpr) -> CodeGenResult<Self::TypeRepr> {
-            Ok(format!("{:?}", ty))
+    impl Default for DebugPrinter {
+        fn default() -> Self {
+            Self::new()
         }
     }
 }
