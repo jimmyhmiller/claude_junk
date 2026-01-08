@@ -4,6 +4,7 @@
 //! Implement the `Backend` trait to target different platforms (JVM, WASM, LLVM, etc.)
 
 pub mod java_asm;
+pub mod verify;
 
 use crate::ast::*;
 use crate::lexer::F64Wrapper;

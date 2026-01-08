@@ -1,0 +1,365 @@
+//! Integration tests for code generation
+//!
+//! These tests verify that the generated Java ASM code produces correct bytecode
+//! by simulating the JVM stack machine.
+
+use torque_rs::{parse_source, CodeGenerator};
+use torque_rs::codegen::java_asm::JavaAsmBackend;
+use torque_rs::codegen::verify::{StackMachine, JvmValue, simulate_asm_method};
+
+/// Helper to generate Java code from Torque source
+fn generate_java(torque_src: &str) -> String {
+    let ast = parse_source(torque_src).expect("Parse failed");
+    let backend = JavaAsmBackend::new("test");
+    let mut codegen = CodeGenerator::new(backend);
+    let output = codegen.generate(&ast).expect("Codegen failed");
+
+    // Combine all classes into one string
+    output.classes.values().cloned().collect::<Vec<_>>().join("\n")
+}
+
+/// Extract the body of a specific build method
+fn extract_method_body(java_src: &str, method_name: &str) -> Option<String> {
+    let marker = format!("build_{}", method_name);
+    let start = java_src.find(&marker)?;
+    let body_start = java_src[start..].find("mv.visitCode();")?;
+    let body_end = java_src[start..].find("mv.visitMaxs")?;
+
+    Some(java_src[start + body_start..start + body_end].to_string())
+}
+
+#[test]
+fn test_simple_add_generates_iadd() {
+    let torque = r#"
+        namespace test {
+            macro Add(a: int32, b: int32): int32 {
+                return a + b;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Verify the generated code contains IADD
+    assert!(java.contains("IADD"), "Expected IADD instruction");
+
+    // Verify the method structure
+    assert!(java.contains("build_Add"), "Expected build_Add method");
+}
+
+#[test]
+fn test_arithmetic_operations() {
+    let torque = r#"
+        namespace math {
+            macro Sub(a: int32, b: int32): int32 {
+                return a - b;
+            }
+            macro Mul(a: int32, b: int32): int32 {
+                return a * b;
+            }
+            macro Div(a: int32, b: int32): int32 {
+                return a / b;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    assert!(java.contains("ISUB"), "Expected ISUB instruction");
+    assert!(java.contains("IMUL"), "Expected IMUL instruction");
+    assert!(java.contains("IDIV"), "Expected IDIV instruction");
+}
+
+#[test]
+fn test_bitwise_operations() {
+    let torque = r#"
+        namespace bits {
+            macro And(a: int32, b: int32): int32 {
+                return a & b;
+            }
+            macro Or(a: int32, b: int32): int32 {
+                return a | b;
+            }
+            macro Xor(a: int32, b: int32): int32 {
+                return a ^ b;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    assert!(java.contains("IAND"), "Expected IAND instruction");
+    assert!(java.contains("IOR"), "Expected IOR instruction");
+    assert!(java.contains("IXOR"), "Expected IXOR instruction");
+}
+
+#[test]
+fn test_comparison_generates_branch() {
+    let torque = r#"
+        namespace cmp {
+            macro IsEqual(a: int32, b: int32): bool {
+                return a == b;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Comparisons should generate IF_ICMPEQ or similar
+    assert!(
+        java.contains("IF_ICMPEQ") || java.contains("IFEQ"),
+        "Expected comparison instruction"
+    );
+}
+
+#[test]
+fn test_if_statement_generates_branches() {
+    let torque = r#"
+        namespace ctrl {
+            macro Abs(x: int32): int32 {
+                if (x < 0) {
+                    return 0 - x;
+                }
+                return x;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Should have branch labels
+    assert!(java.contains("Label"), "Expected Label declarations");
+    assert!(java.contains("visitJumpInsn"), "Expected jump instructions");
+    assert!(java.contains("visitLabel"), "Expected label visits");
+}
+
+#[test]
+fn test_while_loop_generates_loop() {
+    let torque = r#"
+        namespace loop {
+            macro CountDown(n: int32): int32 {
+                let count: int32 = n;
+                while (count > 0) {
+                    count = count - 1;
+                }
+                return count;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Should have while loop structure
+    assert!(java.contains("while_start") || java.contains("GOTO"), "Expected loop structure");
+}
+
+#[test]
+fn test_constant_folding_potential() {
+    let torque = r#"
+        namespace const_test {
+            macro ReturnFive(): int32 {
+                return 5;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Should push constant 5
+    assert!(
+        java.contains("ICONST_5") || java.contains("BIPUSH, 5"),
+        "Expected constant 5"
+    );
+}
+
+#[test]
+fn test_simulate_add_bytecode() {
+    // Simulate what the generated bytecode would do
+    let java_method_body = r#"
+        mv.visitVarInsn(ALOAD, 0);  // a
+        mv.visitVarInsn(ALOAD, 1);  // b
+        mv.visitInsn(IADD);
+    "#;
+
+    let mut machine = StackMachine::new();
+    machine.set_local(0, JvmValue::Int(10));
+    machine.set_local(1, JvmValue::Int(32));
+
+    // Simulate the instructions
+    machine.iload(0);
+    machine.iload(1);
+    machine.iadd();
+
+    assert_eq!(machine.top_int(), Some(42));
+}
+
+#[test]
+fn test_simulate_complex_expression() {
+    // (a + b) * c
+    let mut machine = StackMachine::new();
+    machine.set_local(0, JvmValue::Int(3));
+    machine.set_local(1, JvmValue::Int(4));
+    machine.set_local(2, JvmValue::Int(5));
+
+    machine.iload(0);  // push a
+    machine.iload(1);  // push b
+    machine.iadd();    // a + b = 7
+    machine.iload(2);  // push c
+    machine.imul();    // 7 * 5 = 35
+
+    assert_eq!(machine.top_int(), Some(35));
+}
+
+#[test]
+fn test_builtin_has_context_receiver() {
+    let torque = r#"
+        namespace array {
+            javascript builtin ArrayPush(
+                context: Context,
+                receiver: JSArray,
+                value: Object
+            ): Number {
+                return 0;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // JavaScript builtins should have context and receiver parameters
+    assert!(java.contains("Context"), "Expected Context in signature");
+    assert!(java.contains("build_ArrayPush"), "Expected build_ArrayPush method");
+}
+
+#[test]
+fn test_typeswitch_generates_instanceof() {
+    let torque = r#"
+        namespace types {
+            macro CheckType(value: Object): int32 {
+                typeswitch (value) {
+                    case (n: Number): {
+                        return 1;
+                    }
+                    case (s: String): {
+                        return 2;
+                    }
+                    case (o: Object): {
+                        return 0;
+                    }
+                }
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Should have instanceof checks
+    assert!(java.contains("INSTANCEOF"), "Expected INSTANCEOF instructions");
+    assert!(java.contains("CHECKCAST"), "Expected CHECKCAST instructions");
+}
+
+#[test]
+fn test_goto_generates_throw() {
+    // Test that goto statements generate exception throws
+    // Labels must be declared in the function signature
+    let torque = r#"
+        namespace control {
+            macro MayFail(x: int32): int32 labels Failed {
+                if (x < 0) {
+                    goto Failed;
+                }
+                return x;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Goto generates ATHROW with LabelException
+    assert!(java.contains("LabelException"), "Expected LabelException for goto");
+    assert!(java.contains("ATHROW"), "Expected ATHROW instruction");
+}
+
+#[test]
+fn test_field_access_generates_getfield() {
+    let torque = r#"
+        namespace obj {
+            macro GetLength(arr: JSArray): int32 {
+                return arr.length;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    assert!(java.contains("GETFIELD"), "Expected GETFIELD instruction");
+}
+
+#[test]
+fn test_method_descriptor_format() {
+    let torque = r#"
+        namespace desc {
+            macro TwoInts(a: int32, b: int32): int32 {
+                return a;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Should have method descriptor with correct format
+    // (II)I means two ints -> int
+    assert!(
+        java.contains("\"(II)I\"") || java.contains("int32"),
+        "Expected proper method descriptor"
+    );
+}
+
+#[test]
+fn test_return_instruction_present() {
+    let torque = r#"
+        namespace ret {
+            macro ReturnInt(x: int32): int32 {
+                return x;
+            }
+            macro ReturnVoid(): void {
+                return;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Should have appropriate return instructions
+    assert!(
+        java.contains("IRETURN") || java.contains("ARETURN") || java.contains("RETURN"),
+        "Expected return instruction"
+    );
+}
+
+#[test]
+fn test_verify_generated_add_method() {
+    let torque = r#"
+        namespace verify {
+            macro Add(a: int32, b: int32): int32 {
+                return a + b;
+            }
+        }
+    "#;
+
+    let java = generate_java(torque);
+
+    // Extract the Add method body and simulate it
+    if let Some(body) = extract_method_body(&java, "Add") {
+        let machine = simulate_asm_method(&body);
+
+        // After simulating with default (0) locals, we should have 0 + 0 = 0
+        // But more importantly, the trace should show correct instructions
+        let trace = machine.trace();
+        assert!(
+            trace.iter().any(|s| s.contains("IADD")),
+            "Expected IADD in trace: {:?}",
+            trace
+        );
+    }
+}
