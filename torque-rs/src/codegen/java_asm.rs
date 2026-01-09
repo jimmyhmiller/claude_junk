@@ -66,6 +66,8 @@ pub struct JavaAsmBackend {
     local_counter: u32,
     /// Variable name to local slot mapping
     locals: HashMap<String, u32>,
+    /// Variable name to type mapping
+    local_types: HashMap<String, JvmType>,
     /// Current namespace path
     namespace_stack: Vec<String>,
     /// Known labels in current scope
@@ -104,6 +106,7 @@ impl JavaAsmBackend {
             label_counter: 0,
             local_counter: 0,
             locals: HashMap::new(),
+            local_types: HashMap::new(),
             namespace_stack: Vec::new(),
             labels: HashMap::new(),
         }
@@ -129,6 +132,35 @@ impl JavaAsmBackend {
         self.local_counter += 1;
         self.locals.insert(name.to_string(), slot);
         slot
+    }
+
+    /// Allocate a local variable slot with type tracking
+    fn alloc_local_typed(&mut self, name: &str, ty: JvmType) -> u32 {
+        let slot = self.alloc_local(name);
+        self.local_types.insert(name.to_string(), ty);
+        slot
+    }
+
+    /// Get the type of a local variable
+    fn get_local_type(&self, name: &str) -> Option<&JvmType> {
+        self.local_types.get(name)
+    }
+
+    /// Infer the type of an expression from local variable context
+    fn infer_expr_type(&self, expr: &Spanned<Expr>) -> JvmType {
+        match &expr.node {
+            Expr::Ident(ident) => {
+                self.get_local_type(&ident.name)
+                    .cloned()
+                    .unwrap_or(JvmType::Int)
+            }
+            Expr::IntLiteral(_) => JvmType::Int,
+            Expr::FloatLiteral(_) => JvmType::Double,
+            Expr::BoolLiteral(_) => JvmType::Boolean,
+            Expr::StringLiteral(_) => JvmType::Object("java/lang/String".to_string()),
+            Expr::Paren(inner) => self.infer_expr_type(inner),
+            _ => JvmType::Int, // Default to int for unknown expressions
+        }
     }
 
     /// Emit a line of code to the current method
@@ -249,6 +281,27 @@ impl JavaAsmBackend {
                 format!("{}[]", self.jvm_to_java(elem))
             }
         }
+    }
+
+    /// Check if a JVM type needs unboxing for arithmetic operations
+    fn needs_unboxing(&self, ty: &JvmType) -> bool {
+        match ty {
+            JvmType::Object(name) => name.contains("Smi") || name.contains("Number"),
+            _ => false,
+        }
+    }
+
+    /// Emit code to unbox a Smi to int (assumes Smi is on stack)
+    fn emit_unbox_smi(&mut self) {
+        self.emit("mv.visitMethodInsn(INVOKEVIRTUAL, \"js/runtime/Smi\", \"intValue\", \"()I\", false);");
+    }
+
+    /// Emit code to box an int to Smi (assumes int is on stack)
+    fn emit_box_smi(&mut self) {
+        self.emit("mv.visitTypeInsn(NEW, \"js/runtime/Smi\");");
+        self.emit("mv.visitInsn(DUP_X1);");
+        self.emit("mv.visitInsn(SWAP);");
+        self.emit("mv.visitMethodInsn(INVOKESPECIAL, \"js/runtime/Smi\", \"<init>\", \"(I)V\", false);");
     }
 
     /// Generate binary operation ASM code
@@ -703,11 +756,12 @@ impl Backend for JavaAsmBackend {
         // Reset local state
         self.local_counter = 0;
         self.locals.clear();
+        self.local_types.clear();
         self.labels.clear();
 
-        // Allocate slots for parameters
-        for (name, _ty) in &params {
-            let _slot = self.alloc_local(name);
+        // Allocate slots for parameters with type tracking
+        for (name, ty) in &params {
+            self.alloc_local_typed(name, ty.clone());
         }
 
         // Create method builder
@@ -767,10 +821,11 @@ impl Backend for JavaAsmBackend {
         // Reset local state
         self.local_counter = 0;
         self.locals.clear();
+        self.local_types.clear();
         self.labels.clear();
 
-        for (name, _) in &params {
-            self.alloc_local(name);
+        for (name, ty) in &params {
+            self.alloc_local_typed(name, ty.clone());
         }
 
         let method = MethodBuilder::new(&decl.name.name, params, return_type);
@@ -913,9 +968,29 @@ impl Backend for JavaAsmBackend {
 
     fn emit_return(&mut self, value: Option<&Spanned<Expr>>) -> CodeGenResult<()> {
         if let Some(expr) = value {
+            let expr_type = self.infer_expr_type(expr);
             self.emit_expr(expr)?;
-            // Determine return type and emit appropriate return
-            self.emit("mv.visitInsn(ARETURN);  // TODO: correct return type");
+
+            // Get the method's return type
+            let return_type = self.current_method.as_ref()
+                .map(|m| m.return_type.clone())
+                .unwrap_or(JvmType::Void);
+
+            // If expression yields int but return type is Smi, box it
+            if matches!(expr_type, JvmType::Int) && self.needs_unboxing(&return_type) {
+                self.emit_box_smi();
+            }
+
+            // Emit appropriate return instruction
+            match &return_type {
+                JvmType::Void => self.emit("mv.visitInsn(RETURN);"),
+                JvmType::Int | JvmType::Boolean | JvmType::Byte |
+                JvmType::Char | JvmType::Short => self.emit("mv.visitInsn(IRETURN);"),
+                JvmType::Long => self.emit("mv.visitInsn(LRETURN);"),
+                JvmType::Float => self.emit("mv.visitInsn(FRETURN);"),
+                JvmType::Double => self.emit("mv.visitInsn(DRETURN);"),
+                JvmType::Object(_) | JvmType::Array(_) => self.emit("mv.visitInsn(ARETURN);"),
+            }
         } else {
             self.emit("mv.visitInsn(RETURN);");
         }
@@ -1372,10 +1447,23 @@ impl Backend for JavaAsmBackend {
             return Ok(AsmValue::Stack);
         }
 
-        // Normal binary ops
+        // Normal binary ops - handle Smi unboxing
+        let left_type = self.infer_expr_type(left);
+        let right_type = self.infer_expr_type(right);
+
+        // Emit left operand and unbox if needed
         self.emit_expr(left)?;
+        if self.needs_unboxing(&left_type) {
+            self.emit_unbox_smi();
+        }
+
+        // Emit right operand and unbox if needed
         self.emit_expr(right)?;
-        self.emit_binary_op(op, &JvmType::Int); // TODO: infer type
+        if self.needs_unboxing(&right_type) {
+            self.emit_unbox_smi();
+        }
+
+        self.emit_binary_op(op, &JvmType::Int);
 
         Ok(AsmValue::Stack)
     }
