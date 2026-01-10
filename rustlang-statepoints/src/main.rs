@@ -13,6 +13,7 @@ mod tagged_value;
 mod stackmap;
 mod mmtk_binding;
 mod gc_runtime;
+mod generational_runtime;
 #[macro_use]
 mod lang;
 
@@ -27,13 +28,24 @@ fn run() {
     use crate::lang::Compiler;
 
     let use_fib_banner = std::env::var("STATEPOINT_FIB").is_ok();
+    let use_simple_gc = std::env::var("SIMPLE_GC").is_ok();
+    let use_gen_gc = std::env::var("GEN_GC").is_ok();
+
+    let gc_name = if use_simple_gc {
+        "Simple GC"
+    } else if use_gen_gc {
+        "Generational GC"
+    } else {
+        "MMTk GC"
+    };
+
     if use_fib_banner {
         println!("╔══════════════════════════════════════════════════════════════════╗");
         println!("║   Fibonacci Benchmark                                            ║");
         println!("╚══════════════════════════════════════════════════════════════════╝\n");
     } else {
         println!("╔══════════════════════════════════════════════════════════════════╗");
-        println!("║   Binary Trees Benchmark with MMTk GC                            ║");
+        println!("║   Binary Trees Benchmark with {:30}║", gc_name);
         println!("╚══════════════════════════════════════════════════════════════════╝\n");
     }
 
@@ -253,26 +265,34 @@ fn run() {
         .expect("Failed to initialize native target");
 
     // ===== Initialize GC =====
-    let use_simple_gc = std::env::var("SIMPLE_GC").is_ok();
-
     let simple_symbols;
     let mmtk_symbols;
+    let generational_symbols;
 
     if use_simple_gc {
         gc_runtime::init();
         simple_symbols = Some(gc_runtime::get_simple_runtime_symbols());
+        mmtk_symbols = None;
+        generational_symbols = None;
+    } else if use_gen_gc {
+        generational_runtime::init();
+        generational_symbols = Some(generational_runtime::get_generational_runtime_symbols());
+        simple_symbols = None;
         mmtk_symbols = None;
     } else {
         mmtk_binding::init_mmtk();
         mmtk_binding::bind_mutator();
         mmtk_symbols = Some(mmtk_binding::get_all_runtime_symbols());
         simple_symbols = None;
+        generational_symbols = None;
     }
 
     // ===== Compile Program =====
     println!("Compiling...");
     let context = Context::create();
-    let mut compiler = Compiler::new_with_gc_mode(&context, "lang_demo", use_simple_gc);
+    // Simple GC and Generational GC use the same code generation mode (retry loop with stack walking)
+    let use_simple_gc_mode = use_simple_gc || use_gen_gc;
+    let mut compiler = Compiler::new_with_gc_mode(&context, "lang_demo", use_simple_gc_mode);
     compiler.compile_function("main", &program);
 
     let (module, rt_fns) = compiler.finish();
@@ -357,6 +377,24 @@ fn run() {
         ee.add_global_mapping(&rt_fns.print_long_lived_check_fn, symbols.print_long_lived_check);
         ee.add_global_mapping(&rt_fns.get_arg_fn, symbols.get_arg);
         ee.add_global_mapping(&rt_fns.max_fn, symbols.max);
+    } else if let Some(ref symbols) = generational_symbols {
+        // Generational GC uses retry loop with try_alloc_cons + gc_with_frame_info
+        ee.add_global_mapping(&rt_fns.try_alloc_cons_fn, symbols.try_alloc_cons);
+        ee.add_global_mapping(&rt_fns.cons_safepoint_fn, symbols.cons_safepoint);
+        ee.add_global_mapping(&rt_fns.gc_fn, symbols.gc);
+        ee.add_global_mapping(&rt_fns.gc_with_frame_info_fn, symbols.gc_with_frame_info);
+        ee.add_global_mapping(&rt_fns.car_fn, symbols.car);
+        ee.add_global_mapping(&rt_fns.cdr_fn, symbols.cdr);
+        ee.add_global_mapping(&rt_fns.set_global_root_fn, symbols.set_global_root);
+        ee.add_global_mapping(&rt_fns.clear_global_root_fn, symbols.clear_global_root);
+        // Generational GC uses the same print/utility functions from mmtk_binding
+        ee.add_global_mapping(&rt_fns.print_fn, mmtk_binding::rt_print as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_list_fn, mmtk_binding::rt_print_list as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_stretch_check_fn, mmtk_binding::rt_print_stretch_check as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_trees_check_fn, mmtk_binding::rt_print_trees_check as *const () as usize);
+        ee.add_global_mapping(&rt_fns.print_long_lived_check_fn, mmtk_binding::rt_print_long_lived_check as *const () as usize);
+        ee.add_global_mapping(&rt_fns.get_arg_fn, mmtk_binding::rt_get_arg as *const () as usize);
+        ee.add_global_mapping(&rt_fns.max_fn, mmtk_binding::rt_max as *const () as usize);
     } else if let Some(ref symbols) = simple_symbols {
         // Simple GC uses try_alloc_cons which returns NULL if heap is full
         ee.add_global_mapping(&rt_fns.try_alloc_cons_fn, symbols.try_alloc_cons);
@@ -420,12 +458,15 @@ fn run() {
         if use_simple_gc {
             // Load stackmaps for simple GC stack walking
             gc_runtime::load_stackmaps(stackmap, main_fn);
+        } else if use_gen_gc {
+            // Load stackmaps for generational GC stack walking
+            generational_runtime::load_stackmaps(stackmap, main_fn);
         } else {
             mmtk_binding::load_stackmaps(stackmap, main_fn);
             // Enable MMTk collection BEFORE execution so GC can actually happen
             mmtk_binding::enable_collection();
         }
-    } else if !use_simple_gc {
+    } else if !use_simple_gc && !use_gen_gc {
         // MMTk without stackmaps - still enable collection
         mmtk_binding::enable_collection();
     }

@@ -1,0 +1,418 @@
+//! Mark and Sweep Garbage Collector
+//!
+//! Used as the old generation in the generational GC.
+
+use std::{error::Error, ffi::c_void, io};
+
+use libc::mprotect;
+
+use super::get_page_size;
+use crate::types::{Header, HeapObject, Word};
+use super::{AllocateAction, Allocator, AllocatorOptions, StackMap, stack_walker::StackWalker};
+
+const DEFAULT_PAGE_COUNT: usize = 1024;
+const MAX_PAGE_COUNT: usize = 1000000;
+
+struct Space {
+    start: *const u8,
+    page_count: usize,
+    highmark: usize,
+    #[allow(unused)]
+    protected: bool,
+}
+
+unsafe impl Send for Space {}
+unsafe impl Sync for Space {}
+
+impl Space {
+    #[allow(unused)]
+    fn word_count(&self) -> usize {
+        (self.page_count * get_page_size()) / 8
+    }
+
+    fn byte_count(&self) -> usize {
+        self.page_count * get_page_size()
+    }
+
+    fn contains(&self, pointer: *const u8) -> bool {
+        let start = self.start as usize;
+        let end = start + self.byte_count();
+        let pointer = pointer as usize;
+        pointer >= start && pointer < end
+    }
+
+    fn copy_data_to_offset(&mut self, offset: usize, data: &[u8]) -> isize {
+        unsafe {
+            let start = self.start.add(offset);
+            let new_pointer = start as isize;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), start as *mut u8, data.len());
+            new_pointer
+        }
+    }
+
+    fn write_object(&mut self, offset: usize, size: Word) -> *const u8 {
+        let mut heap_object = HeapObject::from_untagged(unsafe { self.start.add(offset) });
+        assert!(self.contains(heap_object.get_pointer()));
+        heap_object.write_header(size);
+        heap_object.get_pointer()
+    }
+
+    fn new(default_page_count: usize) -> Self {
+        let pre_allocated_space = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                get_page_size() * MAX_PAGE_COUNT,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+
+        Self::commit_memory(pre_allocated_space, default_page_count * get_page_size()).unwrap();
+
+        Self {
+            start: pre_allocated_space as *const u8,
+            page_count: default_page_count,
+            highmark: 0,
+            protected: false,
+        }
+    }
+
+    fn commit_memory(addr: *mut c_void, size: usize) -> Result<(), io::Error> {
+        unsafe {
+            if mprotect(addr, size, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn double_committed_memory(&mut self) {
+        let new_page_count = self.page_count * 2;
+        Self::commit_memory(self.start as *mut c_void, new_page_count * get_page_size()).unwrap();
+        self.page_count = new_page_count;
+    }
+
+    fn update_highmark(&mut self, highmark: usize) {
+        if highmark > self.highmark {
+            self.highmark = highmark;
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct FreeListEntry {
+    offset: usize,
+    size: usize,
+}
+
+impl FreeListEntry {
+    pub fn end(&self) -> usize {
+        self.offset + self.size
+    }
+
+    pub fn can_hold(&self, size: usize) -> bool {
+        self.size >= size
+    }
+
+    pub fn contains(&self, offset: usize) -> bool {
+        self.offset <= offset && offset < self.end()
+    }
+}
+
+pub struct FreeList {
+    ranges: Vec<FreeListEntry>,
+}
+
+impl FreeList {
+    fn new(starting_range: FreeListEntry) -> Self {
+        FreeList {
+            ranges: vec![starting_range],
+        }
+    }
+
+    fn insert(&mut self, range: FreeListEntry) {
+        let mut i = match self
+            .ranges
+            .binary_search_by_key(&range.offset, |r| r.offset)
+        {
+            Ok(i) | Err(i) => i,
+        };
+
+        if i > 0 && self.ranges[i - 1].end() == range.offset {
+            i -= 1;
+            self.ranges[i].size += range.size;
+        } else {
+            self.ranges.insert(i, range);
+        }
+
+        if i + 1 < self.ranges.len() && self.ranges[i].end() == self.ranges[i + 1].offset {
+            self.ranges[i].size += self.ranges[i + 1].size;
+            self.ranges.remove(i + 1);
+        }
+    }
+
+    fn allocate(&mut self, size: usize) -> Option<usize> {
+        for (i, r) in self.ranges.iter_mut().enumerate() {
+            if r.can_hold(size) {
+                let addr = r.offset;
+                if addr % 8 != 0 {
+                    panic!("Heap offset is not aligned");
+                }
+
+                r.offset += size;
+                r.size -= size;
+
+                if r.size == 0 {
+                    self.ranges.remove(i);
+                }
+
+                return Some(addr);
+            }
+        }
+        None
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &FreeListEntry> {
+        self.ranges.iter()
+    }
+
+    fn find_entry_contains(&self, offset: usize) -> Option<&FreeListEntry> {
+        self.ranges.iter().find(|&entry| entry.contains(offset))
+    }
+}
+
+pub struct MarkAndSweep {
+    space: Space,
+    free_list: FreeList,
+    options: AllocatorOptions,
+}
+
+impl MarkAndSweep {
+    pub fn contains(&self, pointer: *const u8) -> bool {
+        self.space.contains(pointer)
+    }
+
+    pub fn heap_start(&self) -> usize {
+        self.space.start as usize
+    }
+
+    pub fn heap_size(&self) -> usize {
+        self.space.byte_count()
+    }
+
+    fn can_allocate(&self, words: usize) -> bool {
+        let words = Word::from_word(words);
+        let header_size = if words.to_words() > Header::MAX_INLINE_SIZE {
+            16
+        } else {
+            8
+        };
+        let size = words.to_bytes() + header_size;
+        let spot = self
+            .free_list
+            .iter()
+            .enumerate()
+            .find(|(_, x)| x.size >= size);
+        spot.is_some()
+    }
+
+    fn allocate_inner(
+        &mut self,
+        words: Word,
+        data: Option<&[u8]>,
+    ) -> Result<AllocateAction, Box<dyn Error>> {
+        let header_size = if words.to_words() > Header::MAX_INLINE_SIZE {
+            16
+        } else {
+            8
+        };
+        let size_bytes = words.to_bytes() + header_size;
+
+        let offset = self.free_list.allocate(size_bytes);
+        if let Some(offset) = offset {
+            self.space.update_highmark(offset);
+            let pointer = self.space.write_object(offset, words);
+            if let Some(data) = data {
+                self.space.copy_data_to_offset(offset, data);
+            }
+            return Ok(AllocateAction::Allocated(pointer));
+        }
+
+        Ok(AllocateAction::Gc)
+    }
+
+    pub fn copy_data_to_offset(&mut self, data: &[u8]) -> *const u8 {
+        let header_value = usize::from_ne_bytes(data[0..8].try_into().unwrap());
+        let header_size = if Header::is_large_object_bit_set(header_value) {
+            16
+        } else {
+            8
+        };
+
+        let pointer = self
+            .allocate_inner(Word::from_bytes(data.len() - header_size), Some(data))
+            .unwrap();
+
+        if let AllocateAction::Allocated(pointer) = pointer {
+            pointer
+        } else {
+            #[cfg(feature = "debug-gc")]
+            eprintln!(
+                "[GC DEBUG] copy_data_to_offset: allocation failed, data.len={}, header_size={}",
+                data.len(),
+                header_size
+            );
+            self.grow();
+            self.copy_data_to_offset(data)
+        }
+    }
+
+    fn mark(
+        &self,
+        stack_base: usize,
+        stack_map: &super::StackMap,
+        frame_pointer: usize,
+        gc_return_addr: usize,
+    ) {
+        let mut to_mark: Vec<HeapObject> = Vec::with_capacity(128);
+
+        StackWalker::walk_stack_roots_with_return_addr(
+            stack_base,
+            frame_pointer,
+            gc_return_addr,
+            stack_map,
+            |_, pointer| {
+                to_mark.push(HeapObject::from_tagged(pointer));
+            },
+        );
+
+        while let Some(object) = to_mark.pop() {
+            if object.marked() {
+                continue;
+            }
+
+            object.mark();
+            for child in object.get_heap_references() {
+                to_mark.push(child);
+            }
+        }
+    }
+
+    fn sweep(&mut self) {
+        let mut offset = 0;
+
+        loop {
+            if offset > self.space.highmark {
+                break;
+            }
+            if let Some(entry) = self.free_list.find_entry_contains(offset) {
+                offset = entry.end();
+                continue;
+            }
+            let heap_object = HeapObject::from_untagged(unsafe { self.space.start.add(offset) });
+
+            let full_size = heap_object.full_size();
+
+            if heap_object.marked() {
+                heap_object.unmark();
+                offset += full_size;
+                offset = (offset + 7) & !7;
+                continue;
+            }
+            let size = full_size;
+            let entry = FreeListEntry { offset, size };
+            self.free_list.insert(entry);
+            offset += size;
+            offset = (offset + 7) & !7;
+            if offset % 8 != 0 {
+                panic!("Heap offset is not aligned");
+            }
+
+            if offset > self.space.byte_count() {
+                panic!("Heap offset is out of bounds");
+            }
+        }
+    }
+
+    pub fn new_with_page_count(page_count: usize, options: AllocatorOptions) -> Self {
+        let space = Space::new(page_count);
+        let size = space.byte_count();
+        Self {
+            space,
+            free_list: FreeList::new(FreeListEntry { offset: 0, size }),
+            options,
+        }
+    }
+
+    pub fn walk_objects_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(usize, &mut HeapObject),
+    {
+        let mut offset = 0;
+        loop {
+            if offset > self.space.highmark {
+                break;
+            }
+            if let Some(entry) = self.free_list.find_entry_contains(offset) {
+                offset = entry.end();
+                continue;
+            }
+            let ptr = unsafe { self.space.start.add(offset) };
+            let mut heap_object = HeapObject::from_untagged(ptr);
+            f(ptr as usize, &mut heap_object);
+            offset += heap_object.full_size();
+            offset = (offset + 7) & !7;
+        }
+    }
+}
+
+impl Allocator for MarkAndSweep {
+    fn new(options: AllocatorOptions) -> Self {
+        let page_count = DEFAULT_PAGE_COUNT;
+        Self::new_with_page_count(page_count, options)
+    }
+
+    fn try_allocate(
+        &mut self,
+        words: usize,
+        _kind: crate::types::BuiltInTypes,
+    ) -> Result<super::AllocateAction, Box<dyn std::error::Error>> {
+        if self.can_allocate(words) {
+            self.allocate_inner(Word::from_word(words), None)
+        } else {
+            Ok(AllocateAction::Gc)
+        }
+    }
+
+    fn gc(&mut self, stack_map: &StackMap, stack_pointers: &[(usize, usize, usize)]) {
+        if !self.options.gc {
+            return;
+        }
+        let start = std::time::Instant::now();
+        for (stack_base, frame_pointer, gc_return_addr) in stack_pointers {
+            self.mark(*stack_base, stack_map, *frame_pointer, *gc_return_addr);
+        }
+
+        self.sweep();
+        if self.options.print_stats {
+            println!("Mark and sweep took {:?}", start.elapsed());
+        }
+    }
+
+    fn grow(&mut self) {
+        let current_max_offset = self.space.byte_count();
+        self.space.double_committed_memory();
+        let after_max_offset = self.space.byte_count();
+        self.free_list.insert(FreeListEntry {
+            offset: current_max_offset,
+            size: after_max_offset - current_max_offset,
+        });
+    }
+
+    fn get_allocation_options(&self) -> AllocatorOptions {
+        self.options
+    }
+}

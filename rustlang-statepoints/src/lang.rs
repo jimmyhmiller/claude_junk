@@ -592,20 +592,25 @@ impl<'ctx> Compiler<'ctx> {
             }
 
             Expr::Cons(car, cdr) => {
+                // Create slots FIRST so they're available for GC during compilation
+                // of sub-expressions. This prevents car from becoming stale if
+                // cdr compilation triggers GC.
+                let car_slot = self.build_alloca_in_entry("car_slot");
+                let cdr_slot = self.build_alloca_in_entry("cdr_slot");
+
+                // Compile car, then immediately store to protect it
                 let car_ptr = self.compile_expr(car);
+                self.builder.build_store(car_slot, car_ptr).unwrap();
+
+                // Now compile cdr - car is safe in its slot
                 let cdr_ptr = self.compile_expr(cdr);
+                self.builder.build_store(cdr_slot, cdr_ptr).unwrap();
+
                 let live = self.spill_live_gc_ptrs();
 
                 if self.use_simple_gc {
                     // Simple GC: Use retry loop pattern with stack walking
-                    // 1. Store car/cdr in stack slots (stackmap will track them)
-                    // 2. Try to allocate
-                    // 3. If NULL, get frame info and trigger GC at safepoint
-                    // 4. GC walks stack using stackmap to find all roots
-                    let car_slot = self.build_alloca_in_entry("car_slot");
-                    let cdr_slot = self.build_alloca_in_entry("cdr_slot");
-                    self.builder.build_store(car_slot, car_ptr).unwrap();
-                    self.builder.build_store(cdr_slot, cdr_ptr).unwrap();
+                    // car/cdr already stored in slots above
 
                     let current_fn = self.current_fn.unwrap();
                     let retry_bb = self.context.append_basic_block(current_fn, "retry");
@@ -680,11 +685,7 @@ impl<'ctx> Compiler<'ctx> {
                     result
                 } else {
                     // MMTk: Use safepoint-based allocation with frame info
-                    // Store car/cdr in stack slots so GC can find and update them via stackmap
-                    let car_slot = self.build_alloca_in_entry("car_slot");
-                    let cdr_slot = self.build_alloca_in_entry("cdr_slot");
-                    self.builder.build_store(car_slot, car_ptr).unwrap();
-                    self.builder.build_store(cdr_slot, cdr_ptr).unwrap();
+                    // car/cdr already stored in slots above
 
                     let i64_type = self.context.i64_type();
                     let i32_type = self.context.i32_type();
